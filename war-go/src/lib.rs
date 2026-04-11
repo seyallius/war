@@ -16,6 +16,7 @@ pub mod verify;
 
 // Re-export key public APIs for ergonomic use by war-cli and war-tui
 pub use get::fetch_module;
+pub use get::fetch_module_with_go_path;
 pub use init::init_project;
 pub use offline::go_offline;
 pub use online::go_online;
