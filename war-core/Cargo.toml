@@ -1,5 +1,6 @@
 [package]
 name = "war-core"
+description = "Shared domain logic and types for the war CLI toolkit"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,12 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow = "1.0.102"
-chrono.workspace = true
+# Workspace dependencies (inherited)
+#anyhow.workspace = true
+tracing.workspace = true
 dirs.workspace = true
+chrono.workspace = true
 serde.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-tracing.workspace = true
+zip.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true

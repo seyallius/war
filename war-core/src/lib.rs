@@ -1,14 +1,17 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! war-core - Shared domain logic, configuration, and error types for the war CLI toolkit.
+//!
+//! This crate is the gravity center of the war workspace. All language-specific
+//! crates (war-go, war-rust) depend on it for config management, error handling,
+//! and cross-platform utilities.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![warn(missing_docs)]
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod config;
+pub mod error;
+pub mod shell;
+pub mod types;
+
+// Re-export key types for ergonomic downstream use
+pub use config::WarConfig;
+pub use error::WarError;
+pub use types::{ModuleInfo, SyncResult};

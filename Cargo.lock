@@ -2156,7 +2156,6 @@ dependencies = [
 name = "war-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "dirs",
  "serde",
@@ -2164,6 +2163,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]
