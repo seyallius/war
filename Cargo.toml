@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "war-cli",
+    "war-core",
+    "war-go", "war-rust",
+    "war-tui",
+]
+
+[workspace.package]
+# Common package settings inherited by all workspace members
+version = "0.1.0"
+edition = "2021"
+authors = ["Seyed Ali <seyed.ali.devl@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/seyallius/war"
+description = "Offline development toolkit for Rust & Go (and future languages)"
+
+# Shared dependencies across workspace members
+[workspace.dependencies]
+# Core utilities
+#anyhow = "1.0"
+thiserror = "2.0.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6.0.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1.2"
+serde_json = "1.0"
+
+# Async & concurrency
+tokio = { version = "1", features = ["full"] }
+tokio-macros = "2.7.0"
+rayon = "1.8"
+
+# CLI & UX
+clap = { version = "4.6.0", features = ["derive"] }
+clap_derive = "4.6.0"
+dialoguer = "0.12.0"
+
+# File ops
+zip = "8.5.1"
+tempfile = "3.8"
+
+[profile.release]
+# Optimize for binary size and speed
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Fast compilation for development
+opt-level = 0
+debug = true
