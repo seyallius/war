@@ -1,5 +1,6 @@
 [package]
 name = "war-go"
+description = "Go-specific domain logic for the war offline development toolkit"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,17 +8,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow = "1.0.102"
-hex = "0.4.3"
-rayon = "1.11.0"
-regex = "1.12.3"
-serde = "1.0.228"
-serde_json = "1.0.149"
-sha2 = "0.10.9"
-tempfile = "3.27.0"
-thiserror = "2.0.18"
-tokio = "1.51.1"
-toml = "1.1.2"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
-zip = "8.5.1"
+# Async & concurrency
+tokio.workspace = true             # Async spawning of go commands (go get, go mod vendor, etc.)
+rayon.workspace = true             # Parallel .zip creation during cache reconstruction (CPU-bound)
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true             # Generating .info files for Go module cache (JSON format)
+
+# File operations
+zip.workspace = true               # Creating .zip archives per module for ~/go/pkg/mod
+tempfile.workspace = true         # Atomic writes: write to temp dir, then rename() into cache
+dirs.workspace = true              # Resolving ~/go/pkg/mod path cross-platform
+
+# Utilities
+tracing.workspace = true          # Structured logging for --verbose mode
+chrono.workspace = true           # Timestamps in reconstructed .info files
+
+# Local workspace crates
+war-core = { path = "../war-core" }     # Shared WarError, WarConfig, ModuleInfo types
+
+[dev-dependencies]
+tempfile.workspace = true
