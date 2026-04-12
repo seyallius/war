@@ -76,4 +76,13 @@ pub enum WarError {
         /// Whether the operation can be retried
         recoverable: bool,
     },
+
+    /// I/O operation failed during file or directory access.
+    #[error("I/O error: {0}")]
+    IOError(#[from] io::Error),
+
+
+    /// Failed to parse a file or data structure (go.mod, TOML config, etc.).
+    #[error("parse error: {0}")]
+    ParseError(String),
 }

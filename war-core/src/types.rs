@@ -7,6 +7,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Represents a single vendored module parsed from vendor/modules.txt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VendorModule {
+    /// Module import path (e.g. "github.com/gin-gonic/gin").
+    pub path: String,
+    /// Module version (e.g. "v1.9.1").
+    pub version: String,
+    /// Whether this module is marked `## explicit`.
+    pub explicit: bool,
+    /// Minimum Go version requirement (from `## explicit; go 1.20`).
+    pub go_version: Option<String>,
+    /// List of packages (subdirectories) used from this module.
+    pub packages: Vec<String>,
+}
+
 /// Represents a single Go module entry parsed from vendor/modules.txt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleInfo {

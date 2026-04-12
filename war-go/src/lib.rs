@@ -20,4 +20,5 @@ pub use get::fetch_module_with_go_path;
 pub use init::init_project;
 pub use offline::go_offline;
 pub use online::go_online;
+pub use vendor::{parse_modules_txt, parse_vendor_manifest};
 pub use verify::verify_offline;
