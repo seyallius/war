@@ -3,7 +3,7 @@
 //! These tests verify that .info/.mod/.zip files are correctly generated,
 //! written atomically, and placed in the proper Go module cache layout.
 
-use std::fs;
+use std::{fs, path::PathBuf};
 use tempfile::tempdir;
 use war_core::types::VendorModule;
 use war_go::cache::reconstruct_cache;
@@ -20,6 +20,7 @@ fn test_reconstruct_cache_creates_info_file() {
         explicit: true,
         go_version: Some("1.20".to_string()),
         packages: vec!["github.com/gin-gonic/gin".to_string()],
+        vendor_path: PathBuf::new(),
     }];
 
     reconstruct_cache(&modules, cache_root.path()).unwrap();
@@ -57,6 +58,7 @@ fn test_atomic_write_prevents_partial_files() {
         explicit: false,
         go_version: None,
         packages: vec![],
+        vendor_path: PathBuf::new(),
     }];
 
     // First sync should succeed
@@ -99,6 +101,7 @@ fn test_reconstruct_cache_handles_multiple_modules() {
             explicit: true,
             go_version: Some("1.20".to_string()),
             packages: vec!["github.com/gin-gonic/gin".to_string()],
+            vendor_path: PathBuf::new(),
         },
         VendorModule {
             path: "golang.org/x/net".to_string(),
@@ -106,6 +109,7 @@ fn test_reconstruct_cache_handles_multiple_modules() {
             explicit: false,
             go_version: None,
             packages: vec!["golang.org/x/net/html".to_string()],
+            vendor_path: PathBuf::new(),
         },
     ];
 
@@ -148,6 +152,7 @@ fn test_reconstruct_cache_is_idempotent() {
         explicit: true,
         go_version: Some("1.21".to_string()),
         packages: vec!["github.com/example/lib".to_string()],
+        vendor_path: PathBuf::new(),
     }];
 
     // First run
@@ -193,6 +198,7 @@ fn test_reconstruct_cache_parallel_performance() {
                 None
             },
             packages: vec![format!("github.com/test/module-{}/subpkg", i)],
+            vendor_path: PathBuf::new(),
         })
         .collect();
 
@@ -223,4 +229,50 @@ fn test_reconstruct_cache_parallel_performance() {
             info_path
         );
     }
+}
+
+/// Test that .mod files are correctly copied from vendor source
+#[test]
+fn test_reconstruct_cache_copies_mod_file() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let cache_root = tempdir().unwrap();
+    let vendor_root = tempdir().unwrap();
+
+    // Create mock vendor structure with go.mod
+    let vendor_mod_dir = vendor_root
+        .path()
+        .join("github.com")
+        .join("test")
+        .join("lib");
+    fs::create_dir_all(&vendor_mod_dir).unwrap();
+    fs::write(
+        vendor_mod_dir.join("go.mod"),
+        "module github.com/test/lib\n\ngo 1.21\n",
+    )
+    .unwrap();
+
+    let modules = vec![VendorModule {
+        path: "github.com/test/lib".to_string(),
+        version: "v1.0.0".to_string(),
+        explicit: true,
+        go_version: Some("1.21".to_string()),
+        packages: vec!["github.com/test/lib".to_string()],
+        vendor_path: vendor_mod_dir,
+    }];
+
+    reconstruct_cache(&modules, cache_root.path()).unwrap();
+
+    let mod_path = cache_root
+        .path()
+        .join("github.com!test!lib")
+        .join("@v")
+        .join("v1.0.0.mod");
+
+    assert!(mod_path.exists(), ".mod file not created at {:?}", mod_path);
+
+    let content = fs::read_to_string(&mod_path).unwrap();
+    assert!(content.starts_with("module github.com/test/lib"));
+    assert!(content.contains("go 1.21"));
 }

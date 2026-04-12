@@ -70,6 +70,9 @@ fn sync_module_cache(module: &VendorModule, cache_root: &Path) -> Result<(), War
     // Generate and write .info file (atomic)
     write_info_file(module, &module_cache_dir)?;
 
+    // Copy .mod file from vendor source (atomic)
+    write_mod_file(module, &module_cache_dir)?;
+
     // .mod and .zip will be implemented in next steps
     Ok(())
 }
@@ -154,6 +157,50 @@ pub fn generate_info_content(module: &VendorModule) -> Result<String, WarError> 
     })
 }
 
+/// Copy the .mod file from vendored source to cache, using atomic write.
+///
+/// The .mod file is simply the module's go.mod file. For vendored modules,
+/// it lives at vendor/<module_path>/go.mod. If not found, we synthesize a
+/// minimal go.mod with just the module path and version.
+fn write_mod_file(module: &VendorModule, cache_dir: &Path) -> Result<(), WarError> {
+    let mod_path = cache_dir.join(format!("{}.mod", module.version));
+
+    // Try to read from vendor source first
+    let content = if module.vendor_path.join("go.mod").exists() {
+        fs::read_to_string(module.vendor_path.join("go.mod")).map_err(|e| {
+            WarError::CacheWriteError {
+                module: module.path.clone(),
+                source: e,
+            }
+        })?
+    } else {
+        // Synthesize minimal go.mod if vendored copy is missing
+        // This handles edge cases like indirect deps or older modules
+        format!("module {}\n\ngo 1.20\n", module.path)
+    };
+
+    // Atomic write: write to temp file in same directory, then rename
+    let temp_file = NamedTempFile::new_in(cache_dir).map_err(|e| WarError::CacheWriteError {
+        module: module.path.clone(),
+        source: e,
+    })?;
+
+    fs::write(temp_file.path(), content).map_err(|e| WarError::CacheWriteError {
+        module: module.path.clone(),
+        source: e,
+    })?;
+
+    // Atomic rename into final location
+    temp_file
+        .persist(&mod_path)
+        .map_err(|e| WarError::CacheWriteError {
+            module: module.path.clone(),
+            source: e.error,
+        })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -166,6 +213,7 @@ mod cache_tests {
             explicit: true,
             go_version: Some("1.20".to_string()),
             packages: vec!["github.com/gin-gonic/gin".to_string()],
+            vendor_path: PathBuf::new(),
         };
 
         let content = generate_info_content(&module).unwrap();
@@ -201,6 +249,7 @@ mod cache_tests {
             explicit: false,
             go_version: None,
             packages: vec![],
+            vendor_path: PathBuf::new(),
         };
 
         let content = generate_info_content(&module).unwrap();
@@ -217,5 +266,68 @@ mod cache_tests {
         // Verify origin is either null or missing for implicit modules
         // (based on implementation, it's null because we use None)
         assert!(parsed["origin"].is_null());
+    }
+
+    #[test]
+    fn test_write_mod_file_from_vendor_source() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let cache_dir = tempdir().unwrap();
+        let vendor_dir = tempdir().unwrap();
+
+        // Create a mock vendored go.mod
+        let vendor_mod = vendor_dir.path().join("go.mod");
+        fs::write(
+            &vendor_mod,
+            "module github.com/test/lib\n\ngo 1.21\n\nrequire github.com/foo/bar v1.0.0\n",
+        )
+        .unwrap();
+
+        let module = VendorModule {
+            path: "github.com/test/lib".to_string(),
+            version: "v1.2.3".to_string(),
+            explicit: true,
+            go_version: Some("1.21".to_string()),
+            packages: vec![],
+            vendor_path: vendor_dir.path().to_path_buf(),
+        };
+
+        write_mod_file(&module, cache_dir.path()).unwrap();
+
+        let mod_path = cache_dir.path().join("v1.2.3.mod");
+        assert!(mod_path.exists(), ".mod file not created");
+
+        let content = fs::read_to_string(mod_path).unwrap();
+        assert!(content.starts_with("module github.com/test/lib"));
+        assert!(content.contains("go 1.21"));
+        assert!(content.contains("github.com/foo/bar v1.0.0"));
+    }
+
+    #[test]
+    fn test_write_mod_file_synthesizes_fallback() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let cache_dir = tempdir().unwrap();
+        let vendor_dir = tempdir().unwrap();
+
+        // No go.mod in vendor dir → should synthesize fallback
+        let module = VendorModule {
+            path: "github.com/indirect/dep".to_string(),
+            version: "v0.5.0".to_string(),
+            explicit: false,
+            go_version: None,
+            packages: vec![],
+            vendor_path: vendor_dir.path().to_path_buf(),
+        };
+
+        write_mod_file(&module, cache_dir.path()).unwrap();
+
+        let mod_path = cache_dir.path().join("v0.5.0.mod");
+        assert!(mod_path.exists());
+
+        let content = fs::read_to_string(mod_path).unwrap();
+        assert_eq!(content, "module github.com/indirect/dep\n\ngo 1.20\n");
     }
 }

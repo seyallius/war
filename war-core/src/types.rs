@@ -20,6 +20,8 @@ pub struct VendorModule {
     pub go_version: Option<String>,
     /// List of packages (subdirectories) used from this module.
     pub packages: Vec<String>,
+    /// Filesystem path to the vendored source directory.
+    pub vendor_path: PathBuf,
 }
 
 /// Represents a single Go module entry parsed from vendor/modules.txt.

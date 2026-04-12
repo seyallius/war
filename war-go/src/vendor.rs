@@ -4,6 +4,7 @@
 //! a structured Vec<ModuleInfo> for cache reconstruction.
 
 use std::{fs, io, path::Path};
+use std::path::PathBuf;
 use war_core::{types::VendorModule, WarError};
 
 // -------------------------------------------- Public API --------------------------------------------
@@ -125,6 +126,7 @@ fn parse_header(
         explicit: false,
         go_version: None,
         packages: Vec::new(),
+        vendor_path: PathBuf::new(),
     })
 }
 
