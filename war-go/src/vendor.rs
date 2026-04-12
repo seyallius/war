@@ -66,6 +66,23 @@ pub fn parse_modules_txt(content: &str) -> Result<Vec<VendorModule>, WarError> {
     Ok(modules)
 }
 
+/// Parses `vendor/modules.txt` directly from a vendor directory path.
+///
+/// Use this when you already have the resolved vendor directory (e.g., from config or CLI flag),
+/// rather than a project root. This avoids double-appending "/vendor".
+pub fn parse_vendor_manifest_from_dir(vendor_dir: &Path) -> Result<Vec<VendorModule>, WarError> {
+    let manifest_path = vendor_dir.join("modules.txt");
+    if !manifest_path.exists() {
+        return Err(WarError::IOError(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("modules.txt not found at {}", manifest_path.display()),
+        )));
+    }
+
+    let content = fs::read_to_string(&manifest_path).map_err(WarError::IOError)?;
+    parse_modules_txt(&content)
+}
+
 // --------------------------------------------- Internal Helpers ---------------------------------------------
 
 /// Parse single line entry in `vendors/modules.txt`.
@@ -268,5 +285,23 @@ github.com/stretchr/testify/assert
         assert_eq!(modules.len(), 1);
         assert!(!modules[0].explicit);
         assert!(modules[0].go_version.is_none());
+    }
+
+    #[test]
+    fn test_parse_vendor_manifest_from_dir() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let modules_txt = "\
+# github.com/test/lib v1.0.0
+## explicit; go 1.20
+github.com/test/lib
+";
+        fs::write(temp.path().join("modules.txt"), modules_txt).unwrap();
+
+        let modules = parse_vendor_manifest_from_dir(temp.path()).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].path, "github.com/test/lib");
+        assert_eq!(modules[0].version, "v1.0.0");
     }
 }
