@@ -3,8 +3,8 @@
 //! Provides a pure function to parse Go's vendor manifest into
 //! a structured Vec<ModuleInfo> for cache reconstruction.
 
-use std::{fs, io, path::Path};
 use std::path::PathBuf;
+use std::{fs, io, path::Path};
 use war_core::{types::VendorModule, WarError};
 
 // -------------------------------------------- Public API --------------------------------------------
@@ -75,23 +75,23 @@ pub fn parse_modules_txt(content: &str) -> Result<Vec<VendorModule>, WarError> {
 /// 2. Metadata line e.g., "## explicit; go 1.20"
 /// 3. Package line e.g., bare import path
 fn parse_modules_line(
-    mut modules: &mut Vec<VendorModule>,
-    mut current: &mut Option<VendorModule>,
+    modules: &mut Vec<VendorModule>,
+    current: &mut Option<VendorModule>,
     line_num: usize,
     line: &&str,
 ) -> Result<(), WarError> {
     // Module header: "# <path> <version>"
     if line.starts_with("# ") && !line.starts_with("##") {
-        let vendor_header = parse_header(&mut modules, &mut current, line_num, line)?;
+        let vendor_header = parse_header(modules, current, line_num, line)?;
         *current = Some(vendor_header)
     }
     // Metadata line: "## explicit; go 1.20"
     else if line.starts_with("## ") {
-        parse_metadata(&mut current, line_num, &line)?
+        parse_metadata(current, line_num, line)?
     }
     // Package line: bare import path
     else {
-        parse_package(&mut current, line_num, line)?
+        parse_package(current, line_num, line)?
     }
     Ok(())
 }

@@ -3,7 +3,11 @@
 //! Wraps `go get`, appends blank import to main.go, runs `go mod tidy`,
 //! and executes `go mod vendor` to capture full dependency graph.
 
-use std::{fs, path::PathBuf, str};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str,
+};
 use tokio::process::Command;
 use war_core::WarError;
 
@@ -77,7 +81,7 @@ async fn run_go_command(
 }
 
 /// Append `_ "<module>"` to the import block in main.go.
-async fn append_blank_import(module_path: &str, project_root: &PathBuf) -> Result<(), WarError> {
+async fn append_blank_import(module_path: &str, project_root: &Path) -> Result<(), WarError> {
     let main_go_path = project_root.join("main.go");
     let content = fs::read_to_string(&main_go_path).map_err(|e| WarError::CacheWriteError {
         module: module_path.to_string(),
