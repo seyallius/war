@@ -17,10 +17,11 @@ clap_derive.workspace = true
 dialoguer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
 
 # Local workspace crates
 war-core = { path = "../war-core" }
-# war-go = { path = "../war-go" }  # Uncomment in Phase 1
+war-go = { path = "../war-go" }
 
 [dev-dependencies]
 tempfile.workspace = true
