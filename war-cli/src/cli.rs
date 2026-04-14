@@ -33,6 +33,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         subcommand: RustCommands,
     }, // Future: uncomment when war-rust is ready
+
     /// Go-specific operations (init, get, offline, online, verify)
     Go {
         #[command(subcommand)]
