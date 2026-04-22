@@ -21,6 +21,10 @@ pub async fn fetch_module(module_spec: &str, project_root: &PathBuf) -> Result<(
     fetch_module_with_go_path(module_spec, project_root, "go").await
 }
 
+//TODO(Async-Std): make it so when `war go get <module>` is called, it prints any sub-sequent logs
+// instead of blocking and printing the result after the operation is completed.
+// Expected implementation: After all the phases and base war-go is in working state.
+
 /// Fetch a module with a specific Go binary path.
 /// Useful for tests or when Go is in a non-standard location.
 pub async fn fetch_module_with_go_path(

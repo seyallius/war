@@ -4,8 +4,8 @@
 
 use clap_derive::Subcommand;
 
-/// Rust command enumeration for offline development operations.
+/// Cargo command enumeration for offline development operations.
 #[derive(Subcommand, Debug)]
-pub(crate) enum RustCommands {
+pub(crate) enum CargoCommands {
     //todo
 }

@@ -17,7 +17,7 @@ use std::{env, path::PathBuf};
 /// Returns an exit code: 0 on success, 1 on error.
 pub(crate) async fn dispatch(command: &Commands) -> i32 {
     match command {
-        Commands::Rust { .. } => {
+        Commands::Cargo { .. } => {
             tracing::error!("Rust support is not yet implemented. Coming soon though...");
             1
         }

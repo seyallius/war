@@ -1,7 +1,7 @@
 //! cli - CLI module defining command-line interface structure and argument parsing
 //! for the war offline development toolkit.
 
-use crate::commands::{GoCommands, RustCommands};
+use crate::commands::{GoCommands, CargoCommands};
 use clap_derive::{Parser, Subcommand};
 
 /// war — Offline development toolkit for Rust & Go (and future languages).
@@ -29,9 +29,9 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
     /// Rust-specific operations (init, add, offline, online, check)
-    Rust {
+    Cargo {
         #[command(subcommand)]
-        subcommand: RustCommands,
+        subcommand: CargoCommands,
     }, // Future: uncomment when war-rust is ready
 
     /// Go-specific operations (init, get, offline, online, verify)
