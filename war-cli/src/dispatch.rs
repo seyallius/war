@@ -114,7 +114,7 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
 
         GoCommands::Verify => {
             tracing::info!("Verifying offline configuration...");
-            match war_go::verify_offline() {
+            match war_go::verify_offline().await {
                 Ok(()) => {
                     tracing::info!("✔ Offline mode verified — no network fallback detected.");
                     0
