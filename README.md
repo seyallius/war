@@ -1,6 +1,6 @@
 # war
 
-Offline-first dependency management, starting with Go.
+Offline-first, airgap-ready dependency management, starting with Go.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75+-stable)](https://rust-lang.org)
@@ -9,37 +9,51 @@ Offline-first dependency management, starting with Go.
 
 ---
 
-The internet got cut. The proxy is blocked. The flight has no WiFi.
+The internet got cut. The proxy is blocked. The secure server has no connection.
 
-`go mod vendor` gives you source, but `go build` still reaches out to `proxy.golang.org` — and it fails.
-`war` fixes that. It takes your `vendor/` directory and reconstructs a complete Go module cache
-(`$GOPATH/pkg/mod`) so you can build with zero network calls.
+Standard tools assume the network is always there. `go mod vendor` gives you source, but toolchains still try to reach
+out, or they miss system-level dependencies.
 
-This tool was born out of necessity. My country's internet is heavily restricted, and I wanted
-to keep developing at home, not just at the office. So I built `war`.
+`war` is designed for true **sneakernet / airgap workflows**. It allows you to build a portable, offline-ready cache of
+all your dependencies on an online machine, transport it via USB/archive, and seamlessly inject it into an offline
+environment using `file://` protocols.
+
+This tool was born out of necessity. My country's internet is heavily restricted, and I wanted to keep developing at
+home, not just at the office. So I built `war`.
 
 ---
 
-## How it works
+## The Airgap Workflow
+
+**1. On the Online Machine (Gather & Pack)**
 
 ```bash
-# Initialize war in your Go project
+# Initialize war in your project
 war go init
 
-# Fetch dependencies (while you still have internet)
+# Fetch dependencies (adds to project AND stages them in a "shopping cart")
 war go get github.com/gin-gonic/gin
 
-# Reconstruct the module cache from vendor/
-war go offline
+# Pack everything into a portable archive for the USB drive
+war go pack cache.zip            # Bundles ALL cached modules
+war go pack cache.zip --staged   # Bundles only modules staged by 'war go get'
+```
 
-# Drop into offline mode
-eval $(war go env)
+**2. On the Offline Machine (Unpack & Build)**
 
-# Build as usual — no network, no proxy, no problem
-go build ./...
+```bash
+# Unpack the archive (Additively merges into ~/.war/cache)
+war go unpack cache.zip
 
-# Come back online when you're ready
-war go online
+# Drop into offline mode (Configures GOPROXY="file://~/.war/cache/go")
+eval $(war go offline)
+
+# Build as usual — zero network, pure local cache
+go mod tidy && go build ./...   # Or...
+war go verify                   # Cleaner, right?
+
+# (Optional) Hydrate native Go cache permanently
+war go sync
 ```
 
 ---
@@ -48,11 +62,11 @@ war go online
 
 `war` is a Cargo workspace. Each crate has one job:
 
-- `war-cli` — thin binary, parses args via `clap`, dispatches to domain crates
-- `war-core` — shared types: `WarError`, `war.lock` config, shell detection
-- `war-go` — all Go-specific logic: init, get, vendor parsing, cache reconstruction, offline/online
-- `war-tui` *(future)* — `ratatui` frontend, same domain logic underneath
-- `war-rust` *(future)* — Cargo offline support, same architecture
+- `war-cli` — thin binary, parses args via `clap`, dispatches to domain crates.
+- `war-core` — shared types: `WarError`, `war.lock` config, shell detection.
+- `war-go` — Go domain logic: `init`, `get`, `pack`, `unpack`, `sync`, offline shell orchestration.
+- `war-tui` *(future)* — `ratatui` frontend, same domain logic underneath.
+- `war-cargo` *(future)* — Rust's cargo offline support, identical architecture.
 
 Adding a new language means adding a new sibling crate. Nothing else changes.
 
@@ -60,16 +74,16 @@ Adding a new language means adding a new sibling crate. Nothing else changes.
 
 ## Implementation Phases
 
-| Phase | Focus                          | Deliverable                                                                             |
-|-------|--------------------------------|-----------------------------------------------------------------------------------------|
-| **0** | Workspace bootstrap            | `Cargo.toml` workspace, all crate stubs, `WarError`, `war.lock` TOML read/write + tests |
-| **1** | `war go init` + `war go get`   | Async process spawning, dummy project scaffolding, blank import injection, `go fmt`     |
-| **2** | `vendor/modules.txt` parser    | Pure function: parse → `Vec<ModuleEntry>`, with property tests                          |
-| **3** | Cache reconstruction core      | `.info`/`.mod`/`.zip` generation, `rayon` parallelism, atomic writes via `tempfile`     |
-| **4** | `war go offline` orchestration | Env var management, interactive error handler (`dialoguer`), `war.lock` update          |
-| **5** | `war go online` + `verify`     | Env restore, `go list`/`go build -x` checks, offline status report                      |
-| **6** | Polish & docs                  | `--verbose` tracing, man pages, `CONTRIBUTING.md`, cross-platform CI                    |
-| **7** | `war-tui` *(future)*           | Ratatui frontend consuming existing APIs                                                |
+| Phase | Focus                       | Deliverable                                                                              | Status    |
+|-------|-----------------------------|------------------------------------------------------------------------------------------|-----------|
+| **0** | Workspace bootstrap         | `Cargo.toml` workspace, crate stubs, `WarError`, CLI arg parsing                         | ✅ Done    |
+| **1** | Basic Commands              | `war go init`, `war go get` (basic fetch), project scaffolding                           | ✅ Done    |
+| **2** | The Airgap Pivot (Refactor) | Refactor `go offline` to use `eval` exports (`GOPROXY=file://...`), drop old vendor hack | 🚧 WIP    |
+| **3** | Transport Layer             | Implement `war go pack` and `war go unpack` (Zip creation/extraction, additive unpack)   | ⏳ Todo    |
+| **4** | The "Shopping Cart"         | Upgrade `war go get` to auto-stage modules; add `--staged` vs `--all` to `pack` command  | ⏳ Todo    |
+| **5** | Cache Synchronization       | Implement `war go sync` to hydrate `$GOPATH/pkg/mod` from unpacked archives              | ⏳ Todo    |
+| **6** | `verify` & Polish           | `war go verify`, offline status report, cross-platform CI, `--verbose` tracing           | ⏳ Todo    |
+| **7** | `war-tui` & `war-cargo`     | Ratatui terminal UI and Rust ecosystem support                                           | 🔮 Future |
 
 ---
 
