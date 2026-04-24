@@ -21,7 +21,6 @@ use war_core::{types::VendorModule, WarError};
 /// <package_path>
 /// <package_path>
 /// ```
-#[deprecated(note = "Pivoted to airgap pack/unpack logic. See `README.md for more details.`")]
 pub fn parse_vendor_manifest(project_root: &Path) -> Result<Vec<VendorModule>, WarError> {
     let manifest_path = project_root.join("vendor").join("modules.txt");
     if !manifest_path.exists() {
@@ -48,7 +47,6 @@ pub fn parse_vendor_manifest(project_root: &Path) -> Result<Vec<VendorModule>, W
 /// <package_path>
 /// <package_path>
 /// ```
-#[deprecated(note = "Pivoted to airgap pack/unpack logic. See `README.md for more details.`")]
 pub fn parse_modules_txt(content: &str) -> Result<Vec<VendorModule>, WarError> {
     let mut modules: Vec<VendorModule> = Vec::new();
     let mut current: Option<VendorModule> = None;
@@ -74,7 +72,6 @@ pub fn parse_modules_txt(content: &str) -> Result<Vec<VendorModule>, WarError> {
 ///
 /// Use this when you already have the resolved vendor directory (e.g., from config or CLI flag),
 /// rather than a project root. This avoids double-appending "/vendor".
-#[deprecated(note = "Pivoted to airgap pack/unpack logic. See `README.md for more details.`")]
 pub fn parse_vendor_manifest_from_dir(vendor_dir: &Path) -> Result<Vec<VendorModule>, WarError> {
     let manifest_path = vendor_dir.join("modules.txt");
     if !manifest_path.exists() {

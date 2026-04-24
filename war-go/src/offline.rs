@@ -24,6 +24,7 @@ use war_core::{
 /// global: if true, persist env changes to shell profile
 ///
 /// Returns the list of environment variable changes made, for caller to display or log.
+#[deprecated(note = "Pivoted to airgap pack/unpack logic. See `README.md` for more details.")]
 pub fn go_offline(
     vendor_path: Option<PathBuf>,
     global: bool,
@@ -53,6 +54,23 @@ pub fn go_offline(
     update_war_lock(&vendor_root)?;
 
     Ok(env_changes)
+}
+
+/// Generates the shell export commands to route Go through our offline file proxy.
+/// The user runs this via: `eval $(war go offline)`.
+pub fn generate_offline_exports() -> String {
+    let cache_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".war")
+        .join("cache")
+        .join("go");
+
+    let proxy_url = format!("file://{}", cache_dir.display());
+
+    format!(
+        "export GOPROXY=\"{}\"\nexport GOSUMDB=\"off\"\nexport GOFLAGS=\"\"\n# Run: eval $(war go offline)",
+        proxy_url
+    )
 }
 
 // -------------------------------------------- Internal Helpers --------------------------------------------

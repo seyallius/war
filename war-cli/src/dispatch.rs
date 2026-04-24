@@ -73,29 +73,27 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
         }
 
         GoCommands::Offline { vendor, global } => {
-            let vendor_path = vendor.as_ref().map(PathBuf::from);
-            tracing::info!(
-                "Enabling offline mode (global: {}, vendor: {:?})",
-                global,
-                vendor_path
-            );
+            tracing::info!("Enabling offline mode (global: {})", global);
 
-            match war_go::go_offline(vendor_path, *global) {
-                Ok(changes) => {
-                    tracing::info!("✔ Offline mode enabled.");
-                    if !changes.is_empty() {
-                        tracing::info!("  Environment variables modified:");
-                        for (key, _value) in &changes {
-                            tracing::info!("    • {}", key);
-                        }
-                    }
-                    0
-                }
-                Err(e) => {
-                    tracing::error!("✘ Failed to enable offline mode: {}", e);
-                    1
-                }
-            }
+            // let vendor_path = vendor.as_ref().map(PathBuf::from);
+            // match war_go::go_offline(vendor_path, *global) {
+            //     Ok(changes) => {
+            //         tracing::info!("✔ Offline mode enabled.");
+            //         if !changes.is_empty() {
+            //             tracing::info!("  Environment variables modified:");
+            //             for (key, _value) in &changes {
+            //                 tracing::info!("    • {}", key);
+            //             }
+            //         }
+            //         0
+            //     }
+            //     Err(e) => {
+            //         tracing::error!("✘ Failed to enable offline mode: {}", e);
+            //         1
+            //     }
+            // }
+            tracing::info!("{}", war_go::generate_offline_exports());
+            0
         }
 
         GoCommands::Online { global } => {

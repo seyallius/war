@@ -1,7 +1,7 @@
-//! get - Fetch a Go module, auto-import it, and vendor dependencies.
+//! get - Fetch a Go module, auto-import it, and downloads dependencies.
 //!
 //! Wraps `go get`, appends blank import to main.go, runs `go mod tidy`,
-//! and executes `go mod vendor` to capture full dependency graph.
+//! and executes `go mod download` to capture full dependency graph.
 
 use std::{
     fs,
@@ -13,7 +13,7 @@ use war_core::WarError;
 
 // -------------------------------------------- Public API --------------------------------------------
 
-/// Fetch a module, inject blank import, tidy, and vendor dependencies.
+/// Fetch a module, inject blank import, tidy, and downloads dependencies.
 ///
 /// module_spec: format "github.com/user/repo[@v1.2.3]"
 /// project_root: path to the Go project containing go.mod and main.go
@@ -42,8 +42,8 @@ pub async fn fetch_module_with_go_path(
     // 3. Run `go mod tidy`
     run_go_command(project_root, go_binary, &["mod", "tidy"]).await?;
 
-    // 4. Run `go mod vendor`
-    run_go_command(project_root, go_binary, &["mod", "vendor"]).await?;
+    // 4. Run `go mod download`
+    run_go_command(project_root, go_binary, &["mod", "download"]).await?;
 
     Ok(())
 }
