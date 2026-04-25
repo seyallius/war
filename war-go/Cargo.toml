@@ -20,6 +20,7 @@ serde_json.workspace = true             # Generating .info files for Go module c
 zip.workspace = true               # Creating .zip archives per module for ~/go/pkg/mod
 tempfile.workspace = true         # Atomic writes: write to temp dir, then rename() into cache
 dirs.workspace = true              # Resolving ~/go/pkg/mod path cross-platform
+walkdir.workspace = true
 
 # Utilities
 tracing.workspace = true          # Structured logging for --verbose mode

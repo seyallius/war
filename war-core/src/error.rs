@@ -81,8 +81,11 @@ pub enum WarError {
     #[error("I/O error: {0}")]
     IOError(#[from] io::Error),
 
-
     /// Failed to parse a file or data structure (go.mod, TOML config, etc.).
     #[error("parse error: {0}")]
     ParseError(String),
+
+    /// Invalid input provided.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }

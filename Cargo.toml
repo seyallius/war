@@ -44,6 +44,7 @@ dialoguer = "0.12.0"
 # File ops
 zip = "8.5.1"
 tempfile = "3.8"
+walkdir = "2.5.0"
 
 [profile.release]
 # Optimize for binary size and speed
