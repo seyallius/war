@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use war_core::WarError;
 
-// -------------------------------------------- Public API --------------------------------------------
+// ----------------------- Public Functions -----------------------
 
 /// Return the default war Go cache root: `~/.war/cache/go`.
 ///
@@ -43,7 +43,9 @@ pub fn generate_offline_exports() -> String {
             let mut exports = Vec::new();
 
             // Construct the file:// URL.  Must be absolute for Go to accept it.
-            exports.push(format!("export GOPROXY=file://{}", cache_str));
+            exports.push(format!("export GOPROXY=file://{}",
+                cache_str
+            ));
             // Disable sum database — not reachable in air-gap.
             exports.push("export GONOSUMDB=*".to_string());
             exports.push("export GOSUMDB=off".to_string());
@@ -64,8 +66,9 @@ pub fn generate_offline_exports() -> String {
 
             out
         }
-        Err(_) => "# ⚠  Could not determine home directory; cannot generate offline exports.\n"
-            .to_string(),
+        Err(_) => {
+            "# ⚠  Could not determine home directory; cannot generate offline exports.\n".to_string()
+        }
     }
 }
 
@@ -114,7 +117,7 @@ pub fn go_offline(
     Ok(changes)
 }
 
-// -------------------------------------------- Internal Helpers --------------------------------------------
+// ----------------------- Internal Helpers -----------------------
 
 /// Restore previously captured environment variables (used by `go_online`).
 #[allow(dead_code)]
@@ -134,17 +137,10 @@ mod tests {
     #[test]
     fn test_generate_offline_exports_contains_goproxy() {
         let exports = generate_offline_exports();
-        assert!(
-            exports.contains("GOPROXY=file://"),
-            "Expected GOPROXY export, got:\n{}",
-            exports
-        );
+        assert!(exports.contains("GOPROXY=file://"), "Expected GOPROXY export, got:\n{}", exports);
         assert!(exports.contains("GONOSUMDB=*"), "Expected GONOSUMDB export");
         assert!(exports.contains("GOSUMDB=off"), "Expected GOSUMDB export");
-        assert!(
-            exports.contains("GOFLAGS=-mod=readonly"),
-            "Expected GOFLAGS export"
-        );
+        assert!(exports.contains("GOFLAGS=-mod=readonly"), "Expected GOFLAGS export");
     }
 
     #[test]
@@ -159,11 +155,7 @@ mod tests {
     #[test]
     fn test_default_cache_root_under_war_dir() {
         let root = default_cache_root().expect("should resolve");
-        assert!(
-            root.ends_with(".war/cache/go"),
-            "Unexpected root: {}",
-            root.display()
-        );
+        assert!(root.ends_with(".war/cache/go"), "Unexpected root: {}", root.display());
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! types - Shared domain types used across war-cli, war-go, and future crates.
+//! types.rs - Shared domain types used across war-cli, war-go, and future crates.
 //!
-//! These types represent the core data structures for module synchronization,
-//! cache reconstruction, and operation results.
+//! Defines the core data structures that flow between the CLI layer, domain
+//! logic crates, and the persistent configuration file (`~/.war/war.lock`).
+//! Every type here is serialisable so it can round-trip through TOML.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,21 @@ pub struct ToggleResult {
     pub env_changes: Vec<(String, Option<String>)>,
 }
 
+/// A single staged module entry — a `(module_path, version)` pair.
+///
+/// Stored in `GoConfig::staged_modules` inside `~/.war/war.lock`.  The
+/// module path uses `/` separators (e.g. `github.com/gin-gonic/gin`) so
+/// it matches the archive path format produced by `pack_modules`.
+/// Deduplication is by `(module, version)` tuple — adding the same pair
+/// twice is a no-op.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StagedModule {
+    /// Go module path, e.g. `github.com/gin-gonic/gin`.
+    pub module: String,
+    /// Semantic version, e.g. `v1.9.1`.
+    pub version: String,
+}
+
 /// Go-specific configuration tracked in war.lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoConfig {
@@ -72,6 +88,22 @@ pub struct GoConfig {
     pub last_sync_timestamp: Option<DateTime<Utc>>,
     /// Go version used during last sync (for compatibility checks).
     pub go_version: Option<String>,
+    /// Modules explicitly staged for `pack --staged` / `unpack --staged`.
+    /// Populated by `war go get` (auto-stage) and `war go stage add`.
+    /// Persisted to `~/.war/war.lock` on every mutation.
+    #[serde(default)]
+    pub staged_modules: Vec<StagedModule>,
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            last_vendor_path: None,
+            last_sync_timestamp: None,
+            go_version: None,
+            staged_modules: Vec::new(),
+        }
+    }
 }
 
 /// Rust-specific configuration (placeholder for future war-rust crate).

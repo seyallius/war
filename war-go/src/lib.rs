@@ -12,6 +12,7 @@ pub mod init;
 pub mod offline;
 pub mod online;
 pub mod pack;
+pub mod stage;
 pub mod unpack;
 #[deprecated(note = "Pivoted to airgap pack/unpack logic. See `README.md` for more details.")]
 pub mod vendor;
@@ -26,6 +27,9 @@ pub use offline::{
 };
 pub use online::go_online;
 pub use pack::pack_modules;
+pub use stage::{
+    add_staged, clear_staged, get_staged_filter, get_staged_modules, list_staged, remove_staged,
+};
 pub use unpack::{unpack_modules, unpack_modules_with_opts, UnpackOpts, UnpackStats};
 pub use vendor::{parse_modules_txt, parse_vendor_manifest};
 pub use verify::verify_offline;

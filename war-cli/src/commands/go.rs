@@ -1,8 +1,8 @@
 //! go.rs - Go-specific subcommands for managing offline Go development environments.
 //!
 //! Provides the full set of CLI verbs: `init`, `get`, `pack`, `unpack`,
-//! `offline`, `online`, and `verify`.  Each variant carries only the flags
-//! it needs — the heavy lifting is delegated to `war_go`.
+//! `stage`, `offline`, `online`, and `verify`.  Each variant carries only
+//! the flags it needs — the heavy lifting is delegated to `war_go`.
 
 use clap_derive::Subcommand;
 
@@ -16,7 +16,7 @@ pub(crate) enum GoCommands {
         name: String,
     },
 
-    /// Fetch a module, auto-import it, and vendor dependencies
+    /// Fetch a module, auto-import it, vendor dependencies, and auto-stage it
     Get {
         /// Module path (e.g., github.com/gin-gonic/gin[@v1.9.1])
         #[arg(value_name = "MODULE")]
@@ -32,6 +32,10 @@ pub(crate) enum GoCommands {
         /// Output zip file path (default: war-pack.zip in current directory)
         #[arg(short, long, default_value = "war-pack.zip")]
         output: String,
+
+        /// Only pack modules that are in the staged list (~/.war/war.lock)
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Unpack a war archive into the local Go module cache
@@ -47,6 +51,16 @@ pub(crate) enum GoCommands {
         /// List files that would be extracted without writing them
         #[arg(long)]
         dry_run: bool,
+
+        /// Only extract modules that are in the staged list (~/.war/war.lock)
+        #[arg(long)]
+        staged: bool,
+    },
+
+    /// Manage the staged-module cart for selective pack/unpack
+    Stage {
+        #[command(subcommand)]
+        subcommand: StageCommands,
     },
 
     /// Switch to offline mode using the local war cache
@@ -59,7 +73,7 @@ pub(crate) enum GoCommands {
         global: bool,
     },
 
-    /// Restore online mode and default Go behavior
+    /// Restore online mode and default Go behaviour
     Online {
         /// Revert global shell profile changes
         #[arg(short, long)]
@@ -68,4 +82,36 @@ pub(crate) enum GoCommands {
 
     /// Verify offline mode is working (dry-run build check)
     Verify,
+}
+
+/// Subcommands for the `war go stage` verb.
+#[derive(Subcommand, Debug)]
+pub(crate) enum StageCommands {
+    /// List all staged modules
+    List,
+
+    /// Add a module to the staged list
+    Add {
+        /// Module path (e.g., github.com/gin-gonic/gin)
+        #[arg(value_name = "MODULE")]
+        module: String,
+
+        /// Version (e.g., v1.9.1)
+        #[arg(value_name = "VERSION")]
+        version: String,
+    },
+
+    /// Remove a module from the staged list
+    Remove {
+        /// Module path (e.g., github.com/gin-gonic/gin)
+        #[arg(value_name = "MODULE")]
+        module: String,
+
+        /// Version (e.g., v1.9.1)
+        #[arg(value_name = "VERSION")]
+        version: String,
+    },
+
+    /// Clear all staged modules
+    Clear,
 }

@@ -27,22 +27,22 @@ use std::{
 use war_core::WarError;
 use zip::ZipArchive;
 
-// -------------------------------------------- Public API --------------------------------------------
+// ----------------------- Public API -----------------------
 
 /// Options controlling how `unpack_modules` behaves.
 ///
 /// Built with a builder-pattern via `UnpackOpts::default()` so new flags
 /// can be added without breaking existing call-sites.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UnpackOpts {
     /// When true, only list the paths that would be extracted — do **not**
     /// write any files to disk.  Useful for `war go unpack --dry-run`.
     pub dry_run: bool,
-}
-impl Default for UnpackOpts {
-    fn default() -> Self {
-        Self { dry_run: false }
-    }
+    /// When set, only zip entries matching the staged `(module, version)`
+    /// pairs are extracted.  Entries that don't match are silently skipped
+    /// (counted as `skipped` in `UnpackStats`).  Populated by the CLI
+    /// when `--staged` is passed.
+    pub staged_filter: Option<Vec<(String, String)>>,
 }
 
 /// Statistics returned after unpacking a war archive.
@@ -193,6 +193,18 @@ pub fn unpack_modules_with_opts(
         let cache_relative = denormalize_cache_path(&stripped);
         let dest = target_root.join(&cache_relative);
 
+        // --- Staged filter: skip entries that don't match the staged list ---
+        if let Some(filter) = &opts.staged_filter {
+            if !entry_matches_staged_filter(&stripped, filter) {
+                tracing::debug!(
+                    "[staged] Skipping non-staged entry: {}",
+                    stripped.display()
+                );
+                stats.skipped += 1;
+                continue;
+            }
+        }
+
         // --- Dry-run: just print and count, don't write ---
         if opts.dry_run {
             tracing::info!("[dry-run] would extract: {}", dest.display());
@@ -240,7 +252,7 @@ pub fn unpack_modules_with_opts(
     Ok(stats)
 }
 
-// --------------------------------------------- Internal Helpers ---------------------------------------------
+// ----------------------- Internal Helpers -----------------------
 
 /// Strip a leading `./` prefix from a path, if present.
 ///
@@ -266,7 +278,52 @@ fn strip_leading_dot_slash(path: &Path) -> PathBuf {
 /// This is a security-critical function. Any zip entry whose normalized
 /// path contains a `Component::ParentDir` is rejected outright.
 fn contains_traversal(path: &Path) -> bool {
-    path.components().any(|c| matches!(c, Component::ParentDir))
+    path.components()
+        .any(|c| matches!(c, Component::ParentDir))
+}
+
+/// Check whether a zip entry path matches any `(module, version)` pair
+/// in the staged filter list.
+///
+/// The entry path uses `/` separators (archive format).  The `@v`
+/// boundary is used to split the module path from the version, mirroring
+/// the logic in `pack::matches_filter`.
+fn entry_matches_staged_filter(entry_path: &Path, filter: &[(String, String)]) -> bool {
+    let parts: Vec<_> = entry_path.components().collect();
+    if parts.len() < 3 {
+        return false;
+    }
+
+    let v_idx = match parts.iter().position(|c| c.as_os_str() == "@v") {
+        Some(idx) => idx,
+        None => return false,
+    };
+
+    if v_idx + 1 >= parts.len() {
+        return false;
+    }
+
+    // Module path is everything before @v, joined with `/`.
+    let module: String = parts[..v_idx]
+        .iter()
+        .filter_map(|c| {
+            if let Component::Normal(os) = c {
+                Some(os.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    // Version is the file stem of the component after @v.
+    let version = Path::new(parts[v_idx + 1].as_os_str())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    filter.contains(&(module, version))
 }
 
 /// Convert a zip entry path from the archive format (using `/` separators
@@ -366,7 +423,9 @@ fn extract_file_atomic<R: Read>(
 ) -> Result<(), WarError> {
     let tmp_path = dest.with_extension(format!(
         "{}.tmp",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("dat")
+        dest.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("dat")
     ));
 
     // Create and write the temporary file.
@@ -557,7 +616,7 @@ mod tests {
         ]);
         write_zip_to_file(&archive_path, &zip_data);
 
-        let opts = UnpackOpts { dry_run: true };
+        let opts = UnpackOpts { dry_run: true, ..Default::default() };
         let stats = unpack_modules_with_opts(&archive_path, &target, &opts).expect("unpack failed");
 
         // In dry-run mode, files are counted as "would-be extracted" but
@@ -668,7 +727,10 @@ mod tests {
         let archive_path = tmp.path().join("dot.zip");
         let target = tmp.path().join("cache");
 
-        let zip_data = build_zip(&[("./github.com/test/mod/@v/v1.0.0.info", b"content")]);
+        let zip_data = build_zip(&[(
+            "./github.com/test/mod/@v/v1.0.0.info",
+            b"content",
+        )]);
         write_zip_to_file(&archive_path, &zip_data);
 
         let stats = unpack_modules(&archive_path, &target).expect("unpack failed");

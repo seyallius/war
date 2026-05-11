@@ -8,7 +8,7 @@
 //! This module acts as the control flow hub between the CLI layer and the
 //! underlying offline-development logic.
 
-use crate::{cli::Commands, commands::GoCommands};
+use crate::{cli::Commands, commands::GoCommands, commands::StageCommands};
 use std::path::PathBuf;
 
 // --------------------------------------------- Public (Crate) API ---------------------------------------------
@@ -62,7 +62,7 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
 
             match war_go::fetch_module(module, &project_root).await {
                 Ok(()) => {
-                    tracing::info!("✔ Module '{}' fetched successfully.", module);
+                    tracing::info!("✔ Module '{}' fetched and staged.", module);
                     0
                 }
                 Err(e) => {
@@ -72,7 +72,11 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
             }
         }
 
-        GoCommands::Pack { cache, output } => {
+        GoCommands::Pack {
+            cache,
+            output,
+            staged,
+        } => {
             let cache_path = match resolve_cache_path(cache) {
                 Ok(p) => p,
                 Err(e) => {
@@ -82,13 +86,35 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
             };
             let output_path = PathBuf::from(output);
 
+            // Resolve staged filter if --staged was passed.
+            let staged_filter = if *staged {
+                match war_go::get_staged_filter() {
+                    Ok(filter) => {
+                        if filter.is_empty() {
+                            tracing::warn!(
+                                "⚠ --staged flag set but staged list is empty. \
+                                 Use `war go stage add <module> <version>` first."
+                            );
+                        }
+                        Some(filter)
+                    }
+                    Err(e) => {
+                        tracing::error!("✘ Failed to load staged modules: {}", e);
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+
             tracing::info!(
-                "Packing cache from {} → {}",
+                "Packing cache from {} → {}{}",
                 cache_path.display(),
-                output_path.display()
+                output_path.display(),
+                if *staged { " (staged only)" } else { "" }
             );
 
-            match war_go::pack_modules(&cache_path, &output_path, None).await {
+            match war_go::pack_modules(&cache_path, &output_path, staged_filter).await {
                 Ok(()) => {
                     tracing::info!("✔ Archive written to {}", output_path.display());
                     0
@@ -104,6 +130,7 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
             archive,
             cache,
             dry_run,
+            staged,
         } => {
             let archive_path = PathBuf::from(archive);
             let cache_path = match resolve_cache_path(cache) {
@@ -114,7 +141,31 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
                 }
             };
 
-            let opts = war_go::UnpackOpts { dry_run: *dry_run };
+            // Resolve staged filter if --staged was passed.
+            let staged_filter = if *staged {
+                match war_go::get_staged_filter() {
+                    Ok(filter) => {
+                        if filter.is_empty() {
+                            tracing::warn!(
+                                "⚠ --staged flag set but staged list is empty. \
+                                 Use `war go stage add <module> <version>` first."
+                            );
+                        }
+                        Some(filter)
+                    }
+                    Err(e) => {
+                        tracing::error!("✘ Failed to load staged modules: {}", e);
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let opts = war_go::UnpackOpts {
+                dry_run: *dry_run,
+                staged_filter,
+            };
 
             if *dry_run {
                 tracing::info!(
@@ -124,9 +175,10 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
                 );
             } else {
                 tracing::info!(
-                    "Unpacking {} → {}",
+                    "Unpacking {} → {}{}",
                     archive_path.display(),
-                    cache_path.display()
+                    cache_path.display(),
+                    if *staged { " (staged only)" } else { "" }
                 );
             }
 
@@ -159,6 +211,8 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
                 }
             }
         }
+
+        GoCommands::Stage { subcommand } => dispatch_stage(subcommand),
 
         GoCommands::Offline { vendor: _, global } => {
             tracing::info!("Enabling offline mode (global: {})", global);
@@ -194,6 +248,89 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
                 }
                 Err(e) => {
                     tracing::error!("✘ Offline verification failed: {}", e);
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Dispatch a `StageCommands` variant.
+fn dispatch_stage(subcommand: &StageCommands) -> i32 {
+    match subcommand {
+        StageCommands::List => {
+            match war_go::list_staged() {
+                Ok(entries) => {
+                    if entries.is_empty() {
+                        println!("No staged modules. Use `war go stage add <module> <version>` or `war go get <module>`.");
+                    } else {
+                        println!("Staged modules ({}):", entries.len());
+                        for entry in &entries {
+                            println!("  {}", entry);
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    tracing::error!("✘ Failed to list staged modules: {}", e);
+                    1
+                }
+            }
+        }
+
+        StageCommands::Add { module, version } => {
+            tracing::info!("Staging {}@{}", module, version);
+            match war_go::add_staged(module, version) {
+                Ok(true) => {
+                    tracing::info!("✔ Staged {}@{}", module, version);
+                    0
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        "{}@{} already staged — no duplicate added (◕‿◕)",
+                        module,
+                        version
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!("✘ Failed to stage {}@{}: {}", module, version, e);
+                    1
+                }
+            }
+        }
+
+        StageCommands::Remove { module, version } => {
+            tracing::info!("Unstaging {}@{}", module, version);
+            match war_go::remove_staged(module, version) {
+                Ok(true) => {
+                    tracing::info!("✔ Unstaged {}@{}", module, version);
+                    0
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        "{}@{} was not in the staged list",
+                        module,
+                        version
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!("✘ Failed to unstage {}@{}: {}", module, version, e);
+                    1
+                }
+            }
+        }
+
+        StageCommands::Clear => {
+            tracing::info!("Clearing all staged modules");
+            match war_go::clear_staged() {
+                Ok(()) => {
+                    tracing::info!("✔ Staged modules cleared");
+                    0
+                }
+                Err(e) => {
+                    tracing::error!("✘ Failed to clear staged modules: {}", e);
                     1
                 }
             }

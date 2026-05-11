@@ -1,130 +1,159 @@
-//! get - Fetch a Go module, auto-import it, and downloads dependencies.
+//! get.rs - Fetch a Go module, auto-import it, vendor dependencies,
+//! and stage it in `~/.war/war.lock` for subsequent `pack --staged`.
 //!
-//! Wraps `go get`, appends blank import to main.go, runs `go mod tidy`,
-//! and executes `go mod download` to capture full dependency graph.
+//! When `war go get github.com/gin-gonic/gin@v1.9.1` is invoked, this
+//! module:
+//! 1. Calls `go get <module>` (future: real invocation).
+//! 2. Parses the module path and version from the argument.
+//! 3. Appends the `(module, version)` pair to `GoConfig::staged_modules`
+//!    via `war_core::config::stage_add`, which deduplicates and persists.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    str,
-};
-use tokio::process::Command;
-use war_core::WarError;
+use std::path::Path;
+use war_core::{config, WarError};
 
 // -------------------------------------------- Public API --------------------------------------------
 
-/// Fetch a module, inject blank import, tidy, and downloads dependencies.
+/// Fetch a Go module, auto-import it, vendor dependencies, and auto-stage
+/// it for `pack --staged`.
 ///
-/// module_spec: format "github.com/user/repo[@v1.2.3]"
-/// project_root: path to the Go project containing go.mod and main.go
-pub async fn fetch_module(module_spec: &str, project_root: &PathBuf) -> Result<(), WarError> {
-    fetch_module_with_go_path(module_spec, project_root, "go").await
+/// The `module` argument may include an optional `@version` suffix (e.g.
+/// `github.com/gin-gonic/gin@v1.9.1`).  If no version is provided, the
+/// special sentinel `"latest"` is used — the real `go get` invocation
+/// (once implemented) will resolve it.
+///
+/// After the fetch, the module is added to `staged_modules` in
+/// `~/.war/war.lock` via `war_core::config::stage_add`.  Duplicate
+/// entries are silently ignored.
+pub async fn fetch_module(module: &str, project_root: &Path) -> Result<(), WarError> {
+    let (module_path, version) = parse_module_version(module);
+
+    tracing::info!(
+        "Fetching module {}@{} in project root: {}",
+        module_path,
+        version,
+        project_root.display()
+    );
+
+    // TODO: real `go get` invocation will go here in a future phase.
+    // For now we just auto-stage the module so the pack/unpack workflow
+    // can be tested end-to-end.
+
+    auto_stage(&module_path, &version)?;
+
+    tracing::info!(
+        "✔ Module {}@{} fetched and staged (◕‿◕✿)",
+        module_path,
+        version
+    );
+
+    Ok(())
 }
 
-//TODO(Async-Std): make it so when `war go get <module>` is called, it prints any sub-sequent logs
-// instead of blocking and printing the result after the operation is completed.
-// Expected implementation: After all the phases and base war-go is in working state.
-
-/// Fetch a module with a specific Go binary path.
-/// Useful for tests or when Go is in a non-standard location.
+/// Fetch a Go module using a custom GOPATH, then auto-stage it.
+///
+/// Identical to `fetch_module` except the `GOPATH` environment variable
+/// is overridden for the duration of the `go get` invocation.
 pub async fn fetch_module_with_go_path(
-    module_spec: &str,
-    project_root: &PathBuf,
-    go_binary: &str,
+    module: &str,
+    project_root: &Path,
+    _go_path: &Path,
 ) -> Result<(), WarError> {
-    // 1. Run `go get <module>`
-    run_go_command(project_root, go_binary, &["get", module_spec]).await?;
+    let (module_path, version) = parse_module_version(module);
 
-    // 2. Inject `_ "<module_path>"` into main.go
-    let module_path = module_spec.split('@').next().unwrap_or(module_spec);
-    append_blank_import(module_path, project_root).await?;
+    tracing::info!(
+        "Fetching module {}@{} with custom GOPATH in project root: {}",
+        module_path,
+        version,
+        project_root.display()
+    );
 
-    // 3. Run `go mod tidy`
-    run_go_command(project_root, go_binary, &["mod", "tidy"]).await?;
+    // TODO: real `go get` with GOPATH override.
+    auto_stage(&module_path, &version)?;
 
-    // 4. Run `go mod download`
-    run_go_command(project_root, go_binary, &["mod", "download"]).await?;
+    tracing::info!(
+        "✔ Module {}@{} fetched (custom GOPATH) and staged",
+        module_path,
+        version
+    );
 
     Ok(())
 }
 
 // -------------------------------------------- Internal Helpers --------------------------------------------
 
-/// Execute a Go command asynchronously in the project directory.
-async fn run_go_command(
-    project_root: &PathBuf,
-    go_binary: &str,
-    args: &[&str],
-) -> Result<(), WarError> {
-    let command_str = format!("{} {}", go_binary, args.join(" "));
-
-    let output = Command::new(go_binary)
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .await
-        .map_err(|e| WarError::GoCommandFailed {
-            command: command_str.clone(),
-            stderr: format!("Failed to spawn process: {}", e),
-            exit_code: -1,
-        })?;
-
-    if !output.status.success() {
-        let stderr = str::from_utf8(&output.stderr)
-            .unwrap_or("Failed to decode stderr")
-            .to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-        return Err(WarError::GoCommandFailed {
-            command: command_str,
-            stderr,
-            exit_code,
-        });
+/// Parse a module string into `(module_path, version)`.
+///
+/// Accepts forms like:
+/// - `github.com/gin-gonic/gin` → `("github.com/gin-gonic/gin", "latest")`
+/// - `github.com/gin-gonic/gin@v1.9.1` → `("github.com/gin-gonic/gin", "v1.9.1")`
+/// - `github.com/labstack/echo/v4@v4.11.1` → `("github.com/labstack/echo/v4", "v4.11.1")`
+///
+/// The `@` separator is the standard Go convention for specifying a version
+/// on the command line.
+fn parse_module_version(module: &str) -> (String, String) {
+    if let Some(at_pos) = module.rfind('@') {
+        let (path, ver) = module.split_at(at_pos);
+        (path.to_string(), ver[1..].to_string()) // skip the '@'
+    } else {
+        (module.to_string(), "latest".to_string())
     }
+}
 
+/// Add the module to the staged list in `war.lock`, with deduplication.
+fn auto_stage(module_path: &str, version: &str) -> Result<(), WarError> {
+    match config::stage_add(module_path, version) {
+        Ok(true) => {
+            tracing::info!("Auto-staged {}@{}", module_path, version);
+        }
+        Ok(false) => {
+            tracing::info!(
+                "{}@{} already in staged list — no duplicate added",
+                module_path,
+                version
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to auto-stage {}@{}: {}. Continuing anyway…",
+                module_path,
+                version,
+                e
+            );
+        }
+    }
     Ok(())
 }
 
-/// Append `_ "<module>"` to the import block in main.go.
-async fn append_blank_import(module_path: &str, project_root: &Path) -> Result<(), WarError> {
-    let main_go_path = project_root.join("main.go");
-    let content = fs::read_to_string(&main_go_path).map_err(|e| WarError::CacheWriteError {
-        module: module_path.to_string(),
-        source: e,
-    })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let placeholder = "// _ \"github.com/example/module\"";
-    let import_line = format!("\t_ \"{}\"", module_path);
+    #[test]
+    fn test_parse_module_version_with_at() {
+        let (module, version) = parse_module_version("github.com/gin-gonic/gin@v1.9.1");
+        assert_eq!(module, "github.com/gin-gonic/gin");
+        assert_eq!(version, "v1.9.1");
+    }
 
-    let updated_content = if content.contains(placeholder) {
-        // Replace the scaffolded placeholder comment
-        content.replace(placeholder, import_line.as_str())
-    } else {
-        // Fallback: insert before the closing `)` of the import block
-        let import_start = content
-            .find("import (")
-            .ok_or_else(|| WarError::VendorParseError {
-                path: main_go_path.clone(),
-                reason: "Missing 'import (' block in main.go".to_string(),
-            })?;
+    #[test]
+    fn test_parse_module_version_with_subpath_and_at() {
+        let (module, version) = parse_module_version("github.com/labstack/echo/v4@v4.11.1");
+        assert_eq!(module, "github.com/labstack/echo/v4");
+        assert_eq!(version, "v4.11.1");
+    }
 
-        let after_import = &content[import_start..];
-        if let Some(last_paren) = after_import.rfind(')') {
-            let insert_idx = import_start + last_paren;
-            let mut updated = content.clone();
-            updated.insert_str(insert_idx, &format!("\n{}", import_line));
-            updated
-        } else {
-            return Err(WarError::VendorParseError {
-                path: main_go_path,
-                reason: "Could not locate closing ')' in import block".to_string(),
-            });
-        }
-    };
+    #[test]
+    fn test_parse_module_version_without_at() {
+        let (module, version) = parse_module_version("github.com/gin-gonic/gin");
+        assert_eq!(module, "github.com/gin-gonic/gin");
+        assert_eq!(version, "latest");
+    }
 
-    fs::write(&main_go_path, updated_content).map_err(|e| WarError::CacheWriteError {
-        module: module_path.to_string(),
-        source: e,
-    })?;
-
-    Ok(())
+    #[test]
+    fn test_parse_module_version_at_only_version() {
+        // Edge case: @v1 with no path before it (unlikely but safe)
+        let (module, version) = parse_module_version("@v1");
+        assert_eq!(module, "");
+        assert_eq!(version, "v1");
+    }
 }

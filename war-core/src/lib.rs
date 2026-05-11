@@ -14,4 +14,4 @@ pub mod types;
 // Re-export key types for ergonomic downstream use
 pub use config::WarConfig;
 pub use error::WarError;
-pub use types::{ModuleInfo, SyncResult};
+pub use types::{ModuleInfo, StagedModule, SyncResult};

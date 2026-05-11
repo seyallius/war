@@ -39,7 +39,7 @@ fn test_parse_real_vendor_manifest() {
         war_go::fetch_module_with_go_path(
             "github.com/gofiber/fiber/v2",
             &project_path,
-            go_path_str,
+            go_path.as_path(),
         )
         .await
         .expect("Failed to fetch module");

@@ -141,7 +141,10 @@ async fn airgap_pack_unpack_offline_loop() {
     // ── 6. Test dry-run mode ──────────────────────────────────────────
     println!("\nStep 6: Dry-run unpack");
     let dry_target = tmp.path().join("dry-run-cache");
-    let dry_opts = UnpackOpts { dry_run: true };
+    let dry_opts = UnpackOpts {
+        dry_run: true,
+        ..Default::default()
+    };
     let dry_stats = unpack_modules_with_opts(&archive_path, &dry_target, &dry_opts)
         .expect("dry-run unpack failed");
 

@@ -9,7 +9,7 @@
 
 use war_core::WarError;
 
-// -------------------------------------------- Public API --------------------------------------------
+// ----------------------- Public Functions -----------------------
 
 /// Restore Go's default online behavior by cleaning up env overrides.
 ///

@@ -51,7 +51,7 @@ fn test_fetch_module_downloads_and_vendors() {
         war_go::fetch_module_with_go_path(
             "github.com/gofiber/fiber/v3",
             &project_path,
-            go_path_str,
+            go_path.as_path(),
         )
         .await
         .expect("Failed to fetch module");

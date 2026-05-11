@@ -20,6 +20,7 @@ fn test_config_round_trip_with_temp_dir() {
         last_vendor_path: Some("/test/vendor".into()),
         last_sync_timestamp: Some(Utc::now()),
         go_version: Some("1.22.2".into()),
+        staged_modules: vec![],
     });
 
     save_config(&config).unwrap();
