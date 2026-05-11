@@ -14,6 +14,7 @@
 //! - Atomic-ish writes: each file is written to a `.tmp` sidecar first, then
 //!   `fs::rename`d into its final location to avoid partial writes on crash.
 //! - Unix permission preservation from the zip entry metadata.
+//! - Dry-run mode: list files that *would* be extracted without writing.
 //!
 //! The extraction is intentionally synchronous (`std::fs` + `zip`) because
 //! single-archive extraction sees no meaningful benefit from async I/O.
@@ -26,7 +27,23 @@ use std::{
 use war_core::WarError;
 use zip::ZipArchive;
 
-// -------------------------------------------- Types --------------------------------------------
+// -------------------------------------------- Public API --------------------------------------------
+
+/// Options controlling how `unpack_modules` behaves.
+///
+/// Built with a builder-pattern via `UnpackOpts::default()` so new flags
+/// can be added without breaking existing call-sites.
+#[derive(Debug, Clone)]
+pub struct UnpackOpts {
+    /// When true, only list the paths that would be extracted — do **not**
+    /// write any files to disk.  Useful for `war go unpack --dry-run`.
+    pub dry_run: bool,
+}
+impl Default for UnpackOpts {
+    fn default() -> Self {
+        Self { dry_run: false }
+    }
+}
 
 /// Statistics returned after unpacking a war archive.
 ///
@@ -48,18 +65,33 @@ pub struct UnpackStats {
     pub failed: usize,
 }
 
-// -------------------------------------------- Public API --------------------------------------------
+/// Extract a `war go pack` archive additively into `target_root` (convenience
+/// wrapper with default options).
+///
+/// Equivalent to `unpack_modules_with_opts(archive_path, target_root,
+/// &UnpackOpts::default())`.
+pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackStats, WarError> {
+    unpack_modules_with_opts(archive_path, target_root, &UnpackOpts::default())
+}
 
-/// Extract a `war go pack` archive additively into `target_root`.
+/// Extract a `war go pack` archive additively into `target_root`, with
+/// configurable options.
 ///
 /// `target_root` is the directory that will receive the extracted files —
 /// typically `~/.war/cache/go/` or a test-specific directory. If it does not
-/// exist, it will be created.
+/// exist, it will be created (unless `dry_run` is set).
 ///
 /// Each zip entry's path is normalized from the archive format (`/`-separated
 /// module paths) to the Go module cache format (`!`-separated first component).
 /// For example, `github.com/gin-gonic/gin/@v/v1.9.1.info` becomes
 /// `github.com!gin-gonic!gin/@v/v1.9.1.info` on disk.
+///
+/// # Dry-run mode
+///
+/// When `opts.dry_run` is true, the function reads the archive and prints
+/// each path that *would* be extracted via `tracing::info!`, but does **not**
+/// create directories or write files.  The returned `UnpackStats` reflects
+/// what would happen (extracted = would-be-extracted count).
 ///
 /// # Errors
 ///
@@ -72,13 +104,19 @@ pub struct UnpackStats {
 ///
 /// Any zip entry whose path contains `..` components is rejected to prevent
 /// directory traversal attacks (e.g. `../../etc/passwd`).
-pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackStats, WarError> {
+pub fn unpack_modules_with_opts(
+    archive_path: &Path,
+    target_root: &Path,
+    opts: &UnpackOpts,
+) -> Result<UnpackStats, WarError> {
     if !archive_path.exists() {
         return Err(WarError::InvalidInput(format!(
             "Archive does not exist: {}",
             archive_path.display()
         )));
     }
+
+    tracing::info!("Opening archive: {}", archive_path.display());
 
     let file = fs::File::open(archive_path)?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
@@ -92,8 +130,13 @@ pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackS
         ))
     })?;
 
-    // Ensure the target root directory exists before extracting anything.
-    fs::create_dir_all(target_root)?;
+    tracing::info!("Archive contains {} entries", archive.len());
+
+    // Ensure the target root directory exists before extracting anything
+    // (skip in dry-run to avoid side-effects).
+    if !opts.dry_run {
+        fs::create_dir_all(target_root)?;
+    }
 
     let mut stats = UnpackStats {
         extracted: 0,
@@ -150,11 +193,18 @@ pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackS
         let cache_relative = denormalize_cache_path(&stripped);
         let dest = target_root.join(&cache_relative);
 
+        // --- Dry-run: just print and count, don't write ---
+        if opts.dry_run {
+            tracing::info!("[dry-run] would extract: {}", dest.display());
+            stats.extracted += 1;
+            continue;
+        }
+
         // Idempotency check: if the file already exists and has the same
         // byte length, skip extraction. This allows re-running unpack on
         // an already-populated cache without overwriting existing files.
         if is_idempotent_skip(&dest, entry.size()) {
-            tracing::debug!("Skipping existing file (size match): {}", dest.display());
+            tracing::info!("Skipping existing file (size match): {}", dest.display());
             stats.skipped += 1;
             continue;
         }
@@ -170,7 +220,7 @@ pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackS
         // crashes mid-extraction.
         match extract_file_atomic(&mut entry, &dest) {
             Ok(()) => {
-                tracing::debug!("Extracted: {}", dest.display());
+                tracing::info!("Extracted: {}", dest.display());
                 stats.extracted += 1;
             }
             Err(e) => {
@@ -465,11 +515,6 @@ mod tests {
         assert_eq!(stats.extracted, 1);
         assert_eq!(stats.failed, 1);
 
-        // Verify no file was written outside the target directory.
-        assert!(
-            !tmp.path().join("../../etc/passwd").exists() || true /* can't really test outside sandbox */
-        );
-
         // Safe entry should exist.
         let safe_path = target.join("github.com!test!mod/@v/v1.0.0.info");
         assert!(safe_path.exists());
@@ -496,6 +541,36 @@ mod tests {
             }
             other => panic!("Expected InvalidInput, got: {:?}", other),
         }
+    }
+
+    // ----------------------- Test: dry-run mode -----------------------
+
+    #[test]
+    fn test_dry_run_does_not_write_files() {
+        let tmp = TempDir::new().expect("tempdir failed");
+        let archive_path = tmp.path().join("test.zip");
+        let target = tmp.path().join("cache");
+
+        let zip_data = build_zip(&[
+            ("github.com/test/mod/@v/v1.0.0.info", b"dry-run content"),
+            ("golang.org/x/text/@v/v0.3.7.info", b"also dry"),
+        ]);
+        write_zip_to_file(&archive_path, &zip_data);
+
+        let opts = UnpackOpts { dry_run: true };
+        let stats = unpack_modules_with_opts(&archive_path, &target, &opts).expect("unpack failed");
+
+        // In dry-run mode, files are counted as "would-be extracted" but
+        // nothing should actually exist on disk.
+        assert_eq!(stats.extracted, 2);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.failed, 0);
+
+        // Target directory should NOT have been created.
+        assert!(
+            !target.exists(),
+            "dry-run should not create the target directory"
+        );
     }
 
     // ----------------------- Test: strip_leading_dot_slash -----------------------

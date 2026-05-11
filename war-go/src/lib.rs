@@ -1,4 +1,8 @@
 //! war-go - Go-specific domain logic for the war offline development toolkit.
+//!
+//! This crate encapsulates all knowledge about Go module management, vendor parsing,
+//! cache reconstruction, and environment toggling. It depends only on war-core for
+//! shared types, config, and error handling — keeping domain logic isolated and testable.
 
 #![warn(missing_docs)]
 
@@ -17,9 +21,11 @@ pub mod verify;
 pub use get::fetch_module;
 pub use get::fetch_module_with_go_path;
 pub use init::init_project;
-pub use offline::{generate_offline_exports, go_offline};
+pub use offline::{
+    default_cache_root, generate_offline_exports, generate_online_exports, go_offline,
+};
 pub use online::go_online;
 pub use pack::pack_modules;
-pub use unpack::{unpack_modules, UnpackStats};
+pub use unpack::{unpack_modules, unpack_modules_with_opts, UnpackOpts, UnpackStats};
 pub use vendor::{parse_modules_txt, parse_vendor_manifest};
 pub use verify::verify_offline;

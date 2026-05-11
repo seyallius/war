@@ -1,6 +1,8 @@
-//! go - Go-specific subcommands for managing offline Go development environments.
-//! Provides functionality for initializing projects, fetching modules,
-//! and toggling between online/offline modes.
+//! go.rs - Go-specific subcommands for managing offline Go development environments.
+//!
+//! Provides the full set of CLI verbs: `init`, `get`, `pack`, `unpack`,
+//! `offline`, `online`, and `verify`.  Each variant carries only the flags
+//! it needs — the heavy lifting is delegated to `war_go`.
 
 use clap_derive::Subcommand;
 
@@ -21,7 +23,33 @@ pub(crate) enum GoCommands {
         module: String,
     },
 
-    /// Switch to offline mode using vendored dependencies
+    /// Pack Go module cache into a portable zip archive
+    Pack {
+        /// Path to the Go cache root to pack (default: ~/.war/cache/go)
+        #[arg(short, long)]
+        cache: Option<String>,
+
+        /// Output zip file path (default: war-pack.zip in current directory)
+        #[arg(short, long, default_value = "war-pack.zip")]
+        output: String,
+    },
+
+    /// Unpack a war archive into the local Go module cache
+    Unpack {
+        /// Path to the zip archive to extract
+        #[arg(value_name = "ARCHIVE")]
+        archive: String,
+
+        /// Target cache directory (default: ~/.war/cache/go)
+        #[arg(short, long)]
+        cache: Option<String>,
+
+        /// List files that would be extracted without writing them
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Switch to offline mode using the local war cache
     Offline {
         /// Path to vendor directory (defaults: war.lock → ./vendor)
         #[arg(long)]
