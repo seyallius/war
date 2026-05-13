@@ -239,6 +239,79 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
             }
         }
 
+        GoCommands::Sync { cache, dest } => {
+            // Resolve the source: CLI flag → default war cache.
+            let src = match resolve_cache_path(cache) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("✘ {}", e);
+                    return 1;
+                }
+            };
+
+            // Resolve the destination: CLI flag → $GOMODCACHE → ~/go/pkg/mod.
+            let dst = if let Some(d) = dest {
+                PathBuf::from(d)
+            } else {
+                match war_go::resolve_gomodcache() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("✘ Failed to resolve native Go module cache: {}", e);
+                        return 1;
+                    }
+                }
+            };
+
+            tracing::info!(
+                "(◕‿◕✿) Syncing war cache → native Go module cache…\n  src: {}\n  dst: {}",
+                src.display(),
+                dst.display()
+            );
+
+            match war_go::sync_cache(&src, &dst) {
+                Ok(result) => {
+                    let stats = &result.stats;
+
+                    tracing::info!(
+                        "✔ Sync complete: {} copied, {} skipped, {} collisions, {} failed",
+                        stats.copied,
+                        stats.skipped,
+                        stats.collisions,
+                        stats.failed
+                    );
+
+                    // Surface any collision warnings so the user can investigate.
+                    if !result.warnings.is_empty() {
+                        tracing::warn!(
+                            "⚠ {} collision(s) detected — existing files were NOT overwritten:",
+                            result.warnings.len()
+                        );
+                        for w in &result.warnings {
+                            tracing::warn!(
+                                "  • {}\n      src  sha256: {}\n      dst  sha256: {}",
+                                w.destination.display(),
+                                w.source_hash,
+                                w.destination_hash
+                            );
+                        }
+                        tracing::warn!("  Resolve collisions manually, then re-run `war go sync`.");
+                    }
+
+                    // Exit 1 only on hard failures, not on collisions or skips.
+                    // Collisions are warnings, not errors — the user is informed.
+                    if stats.failed > 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("✘ Sync failed: {}", e);
+                    1
+                }
+            }
+        }
+
         GoCommands::Verify => {
             tracing::info!("Verifying offline configuration…");
             match war_go::verify_offline().await {
@@ -258,25 +331,23 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
 /// Dispatch a `StageCommands` variant.
 fn dispatch_stage(subcommand: &StageCommands) -> i32 {
     match subcommand {
-        StageCommands::List => {
-            match war_go::list_staged() {
-                Ok(entries) => {
-                    if entries.is_empty() {
-                        println!("No staged modules. Use `war go stage add <module> <version>` or `war go get <module>`.");
-                    } else {
-                        println!("Staged modules ({}):", entries.len());
-                        for entry in &entries {
-                            println!("  {}", entry);
-                        }
+        StageCommands::List => match war_go::list_staged() {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    println!("No staged modules. Use `war go stage add <module> <version>` or `war go get <module>`.");
+                } else {
+                    println!("Staged modules ({}):", entries.len());
+                    for entry in &entries {
+                        println!("  {}", entry);
                     }
-                    0
                 }
-                Err(e) => {
-                    tracing::error!("✘ Failed to list staged modules: {}", e);
-                    1
-                }
+                0
             }
-        }
+            Err(e) => {
+                tracing::error!("✘ Failed to list staged modules: {}", e);
+                1
+            }
+        },
 
         StageCommands::Add { module, version } => {
             tracing::info!("Staging {}@{}", module, version);
@@ -308,11 +379,7 @@ fn dispatch_stage(subcommand: &StageCommands) -> i32 {
                     0
                 }
                 Ok(false) => {
-                    tracing::info!(
-                        "{}@{} was not in the staged list",
-                        module,
-                        version
-                    );
+                    tracing::info!("{}@{} was not in the staged list", module, version);
                     0
                 }
                 Err(e) => {

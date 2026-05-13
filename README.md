@@ -81,8 +81,8 @@ Adding a new language means adding a new sibling crate. Nothing else changes.
 | **2** | The Airgap Pivot (Refactor) | Refactor `go offline` to use `eval` exports (`GOPROXY=file://...`), drop old vendor hack | ✅ Done    |
 | **3** | Transport Layer             | Implement `war go pack` and `war go unpack` (Zip creation/extraction, additive unpack)   | ✅ Done    |
 | **4** | The "Shopping Cart"         | Upgrade `war go get` to auto-stage modules; add `--staged` vs `--all` to `pack` command  | ✅ Done    |
-| **5** | Cache Synchronization       | Implement `war go sync` to hydrate `$GOPATH/pkg/mod` from unpacked archives              | 🚧 WIP    |
-| **6** | `verify` & Polish           | `war go verify`, offline status report, cross-platform CI, `--verbose` tracing           | ⏳ Todo    |
+| **5** | Cache Synchronization       | Implement `war go sync` to hydrate `$GOPATH/pkg/mod` from unpacked archives              | ✅ Done    |
+| **6** | `verify` & Polish           | `war go verify`, offline status report, cross-platform CI, `--verbose` tracing           | 🚧 WIP    |
 | **7** | `war-tui` & `war-cargo`     | Ratatui terminal UI and Rust ecosystem support                                           | 🔮 Future |
 
 ---
