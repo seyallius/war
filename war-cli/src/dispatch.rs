@@ -313,14 +313,48 @@ async fn dispatch_go(subcommand: &GoCommands) -> i32 {
         }
 
         GoCommands::Verify => {
-            tracing::info!("Verifying offline configuration…");
+            tracing::info!("(◕‿◕✿) Running offline verification suite…");
             match war_go::verify_offline().await {
-                Ok(()) => {
-                    tracing::info!("✔ Offline mode verified — no network fallback detected.");
-                    0
+                Ok(report) => {
+                    // Surface every finding to the user so they have the full picture.
+                    for f in &report.findings {
+                        match f.severity {
+                            war_go::Severity::Ok => {
+                                tracing::info!("  ✔ [{}] {}", f.check, f.message)
+                            }
+                            war_go::Severity::Warning => {
+                                tracing::warn!("  ⚠ [{}] {}", f.check, f.message);
+                                if let Some(hint) = &f.hint {
+                                    tracing::warn!("      → {}", hint);
+                                }
+                            }
+                            war_go::Severity::Error => {
+                                tracing::error!("  ✘ [{}] {}", f.check, f.message);
+                                if let Some(hint) = &f.hint {
+                                    tracing::error!("      → {}", hint);
+                                }
+                            }
+                        }
+                    }
+
+                    if report.is_ok() {
+                        tracing::info!("(≧◡≦) All checks passed — `go build` should work offline.");
+                        0
+                    } else {
+                        tracing::warn!(
+                            "⚠ Verification finished with {} error(s) and {} warning(s).",
+                            report.error_count(),
+                            report.warning_count()
+                        );
+                        if report.error_count() > 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                 }
                 Err(e) => {
-                    tracing::error!("✘ Offline verification failed: {}", e);
+                    tracing::error!("✘ Verification aborted due to internal error: {}", e);
                     1
                 }
             }
