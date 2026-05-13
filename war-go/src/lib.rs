@@ -34,4 +34,4 @@ pub use stage::{
 pub use sync::{resolve_gomodcache, sync_cache, CollisionWarning, SyncResult, SyncStats};
 pub use unpack::{unpack_modules, unpack_modules_with_opts, UnpackOpts, UnpackStats};
 pub use vendor::{parse_modules_txt, parse_vendor_manifest};
-pub use verify::verify_offline;
+pub use verify::{verify_offline, Finding, Severity, VerifyReport};
