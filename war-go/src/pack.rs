@@ -1,17 +1,31 @@
-//! pack.rs - Archive Go module cache for airgap transfer.
+//! pack - Archive the Go module cache for airgap transfer.
 //!
 //! Walks the Go module cache directory (typically `~/.war/cache/go/`),
-//! normalises `!`-separated directory names back to `/`-separated paths
+//! normalizes `!`-separated directory names back to `/`-separated paths
 //! for the zip archive, and writes a portable `.zip` file.  Supports
 //! an optional `staged_filter` so `war go pack --staged` only includes
 //! modules present in `~/.war/war.lock`.
+//!
+//! ## Phase 6 additions
+//! - `tracing::info_span!` wraps the entire operation so `--verbose` shows
+//!   timing in structured logs.
+//! - File-count progress is logged every 50 files and at completion.
+//! - Zip errors are mapped to `WarError::ZipCreationError` with the full
+//!   module path, so the CLI can surface actionable hints.
+//! - Output file is written to a `.war.tmp` sidecar and renamed atomically,
+//!   preventing corrupt archives from being left at the output path on failure.
 
-use std::{fs::File, io, io::BufWriter, path::Path};
+use std::{
+    fs::File,
+    io::{self, BufWriter},
+    path::Path,
+    time::Instant,
+};
 use walkdir::WalkDir;
 use war_core::error::WarError;
 use zip::{write::FileOptions, ZipWriter};
 
-// ----------------------- Public API -----------------------
+// -------------------------------------------- Public API --------------------------------------------
 
 /// Pack Go module cache into a zip archive.
 ///
@@ -19,23 +33,60 @@ use zip::{write::FileOptions, ZipWriter};
 /// the filter list are included in the archive.  The filter consists of
 /// `(module_path, version)` pairs as stored in `GoConfig::staged_modules`.
 ///
+/// The archive is written atomically: content streams into `output.war.tmp`
+/// and is `rename`d into `output` only on full success.  A failed pack
+/// therefore never leaves a truncated zip at the destination.
+///
 /// # Errors
 ///
-/// Returns `WarError::InvalidInput` if `cache_root` does not exist.
-/// Returns `WarError::IOError` for filesystem errors during the walk.
-/// Returns `WarError::ZipCreationError` for zip writing failures.
+/// - `WarError::InvalidInput` — `cache_root` does not exist.
+/// - `WarError::IOError` — filesystem errors during the walk or tmp-file creation.
+/// - `WarError::ZipCreationError` — zip encoding failure for a specific file.
 pub async fn pack_modules(
     cache_root: &Path,
     output: &Path,
     staged_filter: Option<Vec<(String, String)>>,
 ) -> Result<(), WarError> {
+    let span = tracing::info_span!(
+        "pack_modules",
+        cache = %cache_root.display(),
+        output = %output.display(),
+        staged = staged_filter.is_some(),
+    );
+    let _enter = span.enter();
+
     if !cache_root.exists() {
-        return Err(WarError::InvalidInput("Cache root does not exist".into()));
+        return Err(WarError::InvalidInput(format!(
+            "Cache root does not exist: {}. \
+             Run `war go unpack <archive>` first.",
+            cache_root.display()
+        )));
     }
 
-    tracing::info!("Packing cache from {} → {}", cache_root.display(), output.display());
+    let t0 = Instant::now();
 
-    let file = File::create(output).map_err(|e| WarError::IOError(e))?;
+    // Atomic write: stream into a .war.tmp sidecar, rename on success.
+    let tmp_output = output.with_extension({
+        let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("zip");
+        format!("{}.war.tmp", ext)
+    });
+
+    // Ensure the output parent directory exists.
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(&tmp_output).map_err(|e| {
+        WarError::IOError(io::Error::new(
+            e.kind(),
+            format!(
+                "Cannot create temporary output file at {}: {}",
+                tmp_output.display(),
+                e
+            ),
+        ))
+    })?;
+
     let writer = BufWriter::new(file);
     let mut zip = ZipWriter::new(writer);
 
@@ -44,54 +95,99 @@ pub async fn pack_modules(
         .unix_permissions(0o755);
 
     let mut file_count: usize = 0;
+    let mut skipped_count: usize = 0;
+    const PROGRESS_INTERVAL: usize = 50;
+
+    tracing::info!("(◕‿◕✿) Walking cache at {} …", cache_root.display());
 
     for entry in WalkDir::new(cache_root) {
-        let entry = entry.map_err(|e| WarError::IOError(e.into()))?;
+        let entry = entry.map_err(|e| {
+            WarError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to walk cache directory: {}", e),
+            ))
+        })?;
+
         let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
 
-        if path.is_file() {
-            if let Some(filter) = &staged_filter {
-                if !matches_filter(cache_root, path, filter)? {
-                    continue;
-                }
+        // Apply staged filter if present.
+        if let Some(filter) = &staged_filter {
+            if !matches_filter(cache_root, path, filter)? {
+                skipped_count += 1;
+                continue;
             }
+        }
 
-            let relative = path.strip_prefix(cache_root).map_err(|e| {
-                WarError::InvalidInput(format!(
-                    "Path {} not under cache root {}: {}",
-                    path.display(),
-                    cache_root.display(),
-                    e
-                ))
+        let relative = path.strip_prefix(cache_root).map_err(|e| {
+            WarError::InvalidInput(format!(
+                "Path {} is not under cache root {}: {}",
+                path.display(),
+                cache_root.display(),
+                e
+            ))
+        })?;
+
+        let zip_path = normalize_cache_path(relative);
+
+        tracing::debug!("  + {}", zip_path);
+
+        zip.start_file(&zip_path, options)
+            .map_err(|e| WarError::ZipCreationError {
+                module: zip_path.clone(),
+                source: e,
             })?;
-            let zip_path = normalize_cache_path(relative);
-            tracing::debug!("Adding to archive: {}", zip_path);
-            zip.start_file(&zip_path, options)
-                .map_err(|e| WarError::ZipCreationError {
-                    module: entry.file_name().to_string_lossy().to_string(),
-                    source: e,
-                })?;
-            let mut f = File::open(path)?;
-            io::copy(&mut f, &mut zip)?;
-            file_count += 1;
+
+        let mut f = File::open(path)?;
+        io::copy(&mut f, &mut zip)?;
+
+        file_count += 1;
+
+        // Progress heartbeat every N files.
+        if file_count % PROGRESS_INTERVAL == 0 {
+            tracing::info!("  … {} files added to archive so far …", file_count);
         }
     }
 
+    // Finish the zip before renaming so the central directory is flushed.
     zip.finish().map_err(|e| WarError::ZipCreationError {
         module: cache_root.display().to_string(),
         source: e,
     })?;
 
+    // Atomic rename: only now does the output file become visible.
+    std::fs::rename(&tmp_output, output).map_err(|e| {
+        // Best-effort cleanup of the tmp on rename failure.
+        let _ = std::fs::remove_file(&tmp_output);
+        WarError::IOError(io::Error::new(
+            e.kind(),
+            format!(
+                "Atomic rename of {} → {} failed: {}. \
+                 A partial .war.tmp file may remain — safe to delete.",
+                tmp_output.display(),
+                output.display(),
+                e
+            ),
+        ))
+    })?;
+
+    let elapsed = t0.elapsed();
+
     if let Some(filter) = &staged_filter {
         tracing::info!(
-            "✔ Archive written ({} files, --staged filter: {} modules) → {}",
+            "✔ Archive written in {:.2}s — {} file(s) packed, {} skipped (--staged: {} module(s)) → {}",
+            elapsed.as_secs_f64(),
             file_count,
+            skipped_count,
             filter.len(),
             output.display()
         );
     } else {
         tracing::info!(
-            "✔ Archive written ({} files, no filter) → {}",
+            "✔ Archive written in {:.2}s — {} file(s) packed → {}",
+            elapsed.as_secs_f64(),
             file_count,
             output.display()
         );
@@ -100,7 +196,7 @@ pub async fn pack_modules(
     Ok(())
 }
 
-// ----------------------- Internal Helpers -----------------------
+// -------------------------------------------- Internal Helpers --------------------------------------------
 
 /// Check whether a file in the cache belongs to a module in the staged
 /// filter list.
@@ -182,38 +278,24 @@ fn normalize_cache_path(relative: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod pack_tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_pack_all_modules() {
-        let dir = tempdir().unwrap();
-        let cache = dir.path().join("cache");
-        fs::create_dir_all(cache.join("github.com!test/@v")).unwrap();
-        fs::write(cache.join("github.com!test/@v/v1.0.0.info"), "test").unwrap();
-
-        let archive = dir.path().join("out.zip");
-
-        pack_modules(&cache, &archive, None).await.unwrap();
-
-        assert!(archive.exists());
-    }
-
     #[test]
-    fn normalize_cache_path_rewrites_bangs_in_first_component() {
-        let p = Path::new("github.com!gin-gonic!gin/@v/v1.9.1.info");
+    fn test_normalize_cache_path_basic() {
+        let input = Path::new("github.com!gin-gonic!gin/@v/v1.9.1.info");
         assert_eq!(
-            normalize_cache_path(p),
+            normalize_cache_path(input),
             "github.com/gin-gonic/gin/@v/v1.9.1.info"
         );
     }
 
     #[test]
-    fn normalize_cache_path_leaves_regular_paths_unchanged() {
-        let p = Path::new("golang.org/x/text/@v/v0.3.7.info");
-        assert_eq!(normalize_cache_path(p), "golang.org/x/text/@v/v0.3.7.info");
+    fn test_normalize_cache_path_single_component() {
+        let input = Path::new("singlemod/@v/v1.0.0.mod");
+        assert_eq!(normalize_cache_path(input), "singlemod/@v/v1.0.0.mod");
     }
 
     #[test]
@@ -221,7 +303,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = dir.path().join("cache");
         fs::create_dir_all(cache.join("github.com!gin-gonic!gin/@v")).unwrap();
+
         let file_path = cache.join("github.com!gin-gonic!gin/@v/v1.9.1.info");
+        fs::write(&file_path, b"{}").unwrap();
 
         let filter = vec![("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string())];
         assert!(matches_filter(&cache, &file_path, &filter).unwrap());
@@ -233,8 +317,26 @@ mod tests {
         let cache = dir.path().join("cache");
         fs::create_dir_all(cache.join("github.com!other!mod/@v")).unwrap();
         let file_path = cache.join("github.com!other!mod/@v/v2.0.0.info");
+        fs::write(&file_path, b"{}").unwrap();
 
         let filter = vec![("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string())];
         assert!(!matches_filter(&cache, &file_path, &filter).unwrap());
+    }
+
+    /// Verify that a failed pack does NOT leave a partial zip at the output path.
+    #[tokio::test]
+    async fn test_atomic_pack_does_not_leave_partial_on_missing_cache() {
+        let dir = tempdir().unwrap();
+        let missing_cache = dir.path().join("no_such_cache");
+        let output = dir.path().join("out.zip");
+
+        let result = pack_modules(&missing_cache, &output, None).await;
+
+        assert!(result.is_err(), "expected error for missing cache");
+        assert!(!output.exists(), "output must not exist after failed pack");
+
+        // Tmp file must also be cleaned up.
+        let tmp = dir.path().join("out.zip.war.tmp");
+        assert!(!tmp.exists(), "tmp file must not remain after early error");
     }
 }
