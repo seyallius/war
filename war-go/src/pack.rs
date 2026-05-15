@@ -215,6 +215,13 @@ pub async fn pack_modules(
 /// The `@v` directory is the boundary marker.  Everything before `@v`
 /// is the module path (with `!` → `/` conversion).  The filename under
 /// `@v` provides the version (before the extension).
+///
+/// # Special case: "latest" version
+///
+/// If the staged filter specifies version `"latest"`, it matches ANY
+/// version of that module in the cache.  This handles the common workflow
+/// where users run `war go get module@latest` and expect all fetched
+/// versions to be included in `pack --staged`.
 fn matches_filter(
     cache_root: &Path,
     file: &Path,
@@ -256,7 +263,10 @@ fn matches_filter(
         .unwrap_or_default()
         .to_string();
 
-    Ok(filter.contains(&(module, version)))
+    // Check for exact match OR "latest" wildcard match
+    Ok(filter.iter().any(|(f_module, f_version)| {
+        f_module == &module && (f_version == "latest" || f_version == &version)
+    }))
 }
 
 /// Convert a Go cache relative path (with `!` separators in the first
