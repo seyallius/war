@@ -30,7 +30,7 @@ pub(crate) enum GoCommands {
         cache: Option<String>,
 
         /// Output zip file path (default: war-pack.zip in current directory)
-        #[arg(short, long, default_value = "war-pack.zip")]
+        #[arg(value_name = "OUTPUT", default_value = "war-pack.zip")]
         output: String,
 
         /// Only pack modules that are in the staged list (~/.war/war.lock)
