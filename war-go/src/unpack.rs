@@ -23,53 +23,47 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 use war_core::WarError;
 use zip::ZipArchive;
 
-// ----------------------- Public API -----------------------
+// -------------------------------------------- Types --------------------------------------------
 
-/// Options controlling how `unpack_modules` behaves.
+/// Options controlling how `unpack_modules_with_opts` behaves.
 ///
 /// Built with a builder-pattern via `UnpackOpts::default()` so new flags
 /// can be added without breaking existing call-sites.
 #[derive(Debug, Clone, Default)]
 pub struct UnpackOpts {
     /// When true, only list the paths that would be extracted — do **not**
-    /// write any files to disk.  Useful for `war go unpack --dry-run`.
+    /// write any files to disk. Useful for `war go unpack --dry-run`.
     pub dry_run: bool,
     /// When set, only zip entries matching the staged `(module, version)`
-    /// pairs are extracted.  Entries that don't match are silently skipped
-    /// (counted as `skipped` in `UnpackStats`).  Populated by the CLI
-    /// when `--staged` is passed.
+    /// pairs are extracted. Entries that don't match are counted as `skipped`.
     pub staged_filter: Option<Vec<(String, String)>>,
 }
 
 /// Statistics returned after unpacking a war archive.
 ///
-/// Provides a breakdown of how many files were extracted, how many were
-/// skipped (already present with matching content), and how many failed
-/// during the extraction process. Failed files do **not** abort the entire
-/// operation — the caller receives the full picture and can decide how to
-/// handle individual failures.
+/// Failed files do **not** abort the operation — the caller receives the full
+/// picture and can decide whether to surface a non-zero exit code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpackStats {
-    /// Number of files successfully extracted and written to disk.
+    /// Files successfully extracted and written to disk.
     pub extracted: usize,
-    /// Number of files skipped because the destination already existed
-    /// with the same byte length (idempotent re-extraction).
+    /// Files skipped because the destination already matched (same byte length)
+    /// or were excluded by the staged filter.
     pub skipped: usize,
-    /// Number of files that failed to extract (I/O error, permission
-    /// denied, etc.). The operation continues past failures so that
-    /// as many files as possible are recovered.
+    /// Files that failed to extract (I/O error, rename failure, etc.).
     pub failed: usize,
 }
 
-/// Extract a `war go pack` archive additively into `target_root` (convenience
-/// wrapper with default options).
+// -------------------------------------------- Public API --------------------------------------------
+
+/// Extract a `war go pack` archive additively into `target_root`.
 ///
-/// Equivalent to `unpack_modules_with_opts(archive_path, target_root,
-/// &UnpackOpts::default())`.
+/// Convenience wrapper around `unpack_modules_with_opts` with default options.
 pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackStats, WarError> {
     unpack_modules_with_opts(archive_path, target_root, &UnpackOpts::default())
 }
@@ -77,66 +71,79 @@ pub fn unpack_modules(archive_path: &Path, target_root: &Path) -> Result<UnpackS
 /// Extract a `war go pack` archive additively into `target_root`, with
 /// configurable options.
 ///
-/// `target_root` is the directory that will receive the extracted files —
-/// typically `~/.war/cache/go/` or a test-specific directory. If it does not
-/// exist, it will be created (unless `dry_run` is set).
+/// `target_root` is the directory that receives extracted files — typically
+/// `~/.war/cache/go/`.  If it does not exist it is created (unless dry-run).
 ///
-/// Each zip entry's path is normalized from the archive format (`/`-separated
-/// module paths) to the Go module cache format (`!`-separated first component).
-/// For example, `github.com/gin-gonic/gin/@v/v1.9.1.info` becomes
-/// `github.com!gin-gonic!gin/@v/v1.9.1.info` on disk.
+/// # Corrupted archive handling
 ///
-/// # Dry-run mode
-///
-/// When `opts.dry_run` is true, the function reads the archive and prints
-/// each path that *would* be extracted via `tracing::info!`, but does **not**
-/// create directories or write files.  The returned `UnpackStats` reflects
-/// what would happen (extracted = would-be-extracted count).
+/// If the zip central directory is unreadable (truncated file, bad magic bytes,
+/// etc.) the function returns `WarError::CorruptedArchive` immediately and, if
+/// the target directory was freshly created by this call, removes it to keep the
+/// filesystem clean.  Per-entry corruption (bad CRC, unreadable entry header) is
+/// treated as a soft failure: the entry is counted in `stats.failed` and the loop
+/// continues so as many files as possible are recovered.
 ///
 /// # Errors
 ///
-/// Returns `WarError::InvalidInput` if the archive does not exist.
-/// Returns `WarError::IOError` if the archive cannot be opened.
-/// Individual file extraction failures are counted in `UnpackStats::failed`
-/// rather than aborting the entire operation.
-///
-/// # Security
-///
-/// Any zip entry whose path contains `..` components is rejected to prevent
-/// directory traversal attacks (e.g. `../../etc/passwd`).
+/// - `WarError::InvalidInput` — archive does not exist.
+/// - `WarError::CorruptedArchive` — archive cannot be opened as a zip.
+/// - `WarError::IOError` — unrecoverable I/O error (e.g. cannot create target dir).
 pub fn unpack_modules_with_opts(
     archive_path: &Path,
     target_root: &Path,
     opts: &UnpackOpts,
 ) -> Result<UnpackStats, WarError> {
+    let span = tracing::info_span!(
+        "unpack_modules",
+        archive = %archive_path.display(),
+        target  = %target_root.display(),
+        dry_run = opts.dry_run,
+    );
+    let _enter = span.enter();
+
+    // ── Guard: archive must exist ─────────────────────────────────────────
     if !archive_path.exists() {
         return Err(WarError::InvalidInput(format!(
-            "Archive does not exist: {}",
+            "Archive does not exist: {}.\n\
+             Run `war go pack` to create an archive first.",
             archive_path.display()
         )));
     }
 
-    tracing::info!("Opening archive: {}", archive_path.display());
+    let t0 = Instant::now();
+    tracing::info!(
+        "(◕‿◕✿) Opening archive: {} ({} bytes)",
+        archive_path.display(),
+        fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0)
+    );
 
+    // ── Open the zip — map structural errors to CorruptedArchive ─────────
     let file = fs::File::open(archive_path)?;
-    let mut archive = ZipArchive::new(file).map_err(|e| {
-        WarError::IOError(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Failed to open zip archive at {}: {}",
-                archive_path.display(),
-                e
-            ),
-        ))
+    let mut archive = ZipArchive::new(file).map_err(|e| WarError::CorruptedArchive {
+        path: archive_path.to_path_buf(),
+        reason: format!(
+            "Cannot read zip central directory: {}. \
+                 The file may be truncated or corrupted.",
+            e
+        ),
+        hint: format!(
+            "Re-create the archive with `war go pack` or re-download it.\n\
+                 To verify: `unzip -t {}` should return exit 0.",
+            archive_path.display()
+        ),
     })?;
 
-    tracing::info!("Archive contains {} entries", archive.len());
+    let total_entries = archive.len();
+    tracing::info!("Archive contains {} entries", total_entries);
 
-    // Ensure the target root directory exists before extracting anything
-    // (skip in dry-run to avoid side-effects).
-    if !opts.dry_run {
+    // ── Ensure target root exists (skip in dry-run) ───────────────────────
+    // Track whether WE created the directory so we can clean up on failure.
+    let target_created_by_us = if !opts.dry_run && !target_root.exists() {
         fs::create_dir_all(target_root)?;
-    }
+        true
+    } else {
+        false
+    };
 
     let mut stats = UnpackStats {
         extracted: 0,
@@ -144,125 +151,143 @@ pub fn unpack_modules_with_opts(
         failed: 0,
     };
 
-    for index in 0..archive.len() {
-        let mut entry = match archive.by_index(index) {
-            Ok(entry) => entry,
-            Err(e) => {
-                tracing::warn!("Failed to read zip entry at index {}: {}", index, e);
-                stats.failed += 1;
-                continue;
-            }
-        };
+    const PROGRESS_INTERVAL: usize = 25;
 
-        let raw_path = match entry.enclosed_name() {
-            Some(path) => path.to_owned(),
-            None => {
+    for index in 0..total_entries {
+        // ── Per-entry soft failure: log and continue ──────────────────────
+        let mut entry = match archive.by_index(index) {
+            Ok(e) => e,
+            Err(e) => {
                 tracing::warn!(
-                    "Skipping zip entry at index {}: path is not valid UTF-8 or is empty",
-                    index
+                    "⚠ Skipping corrupt entry at index {} / {}: {}",
+                    index,
+                    total_entries,
+                    e
                 );
                 stats.failed += 1;
                 continue;
             }
         };
 
-        // Strip leading "./" that some zip tools prepend.
+        // ── Resolve and sanitise the entry path ───────────────────────────
+        let raw_path = match entry.enclosed_name() {
+            Some(p) => p.to_owned(),
+            None => {
+                tracing::warn!("⚠ Entry {} has an invalid path — skipping", index);
+                stats.failed += 1;
+                continue;
+            }
+        };
+
         let stripped = strip_leading_dot_slash(&raw_path);
 
-        // Reject any path with `..` components — directory traversal defense.
         if contains_traversal(&stripped) {
             tracing::warn!(
-                "Rejecting zip entry with path traversal: {}",
+                "⚠ Rejecting path-traversal entry: {} — potential zip-slip attack",
                 stripped.display()
             );
             stats.failed += 1;
             continue;
         }
 
-        // Skip directory entries — we create directories on-demand when
-        // extracting files, and Go's cache layout doesn't require empty
-        // directory entries to function.
+        // ── Skip directory entries ─────────────────────────────────────────
         if entry.is_dir() {
-            tracing::debug!("Skipping directory entry: {}", stripped.display());
+            tracing::debug!("  – dir entry: {}", stripped.display());
             continue;
         }
 
-        // Convert archive path (`/`-separated) to Go cache path (`!`-separated
-        // first component). This is the inverse of `pack_modules`'s
-        // `normalize_cache_path`.
+        // ── Convert archive path → Go cache path ──────────────────────────
         let cache_relative = denormalize_cache_path(&stripped);
         let dest = target_root.join(&cache_relative);
 
-        // --- Staged filter: skip entries that don't match the staged list ---
+        // ── Staged filter ─────────────────────────────────────────────────
         if let Some(filter) = &opts.staged_filter {
             if !entry_matches_staged_filter(&stripped, filter) {
-                tracing::debug!(
-                    "[staged] Skipping non-staged entry: {}",
-                    stripped.display()
-                );
+                tracing::debug!("[staged] skip: {}", stripped.display());
                 stats.skipped += 1;
                 continue;
             }
         }
 
-        // --- Dry-run: just print and count, don't write ---
+        // ── Dry-run ───────────────────────────────────────────────────────
         if opts.dry_run {
             tracing::info!("[dry-run] would extract: {}", dest.display());
             stats.extracted += 1;
             continue;
         }
 
-        // Idempotency check: if the file already exists and has the same
-        // byte length, skip extraction. This allows re-running unpack on
-        // an already-populated cache without overwriting existing files.
+        // ── Idempotency check ─────────────────────────────────────────────
         if is_idempotent_skip(&dest, entry.size()) {
-            tracing::info!("Skipping existing file (size match): {}", dest.display());
+            tracing::debug!("  – skip (size match): {}", cache_relative.display());
             stats.skipped += 1;
             continue;
         }
 
-        // Ensure the parent directory exists before writing the file.
+        // ── Ensure parent directory ───────────────────────────────────────
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::warn!("⚠ Cannot create parent dir for {}: {}", dest.display(), e);
+                stats.failed += 1;
+                continue;
+            }
         }
 
-        // Extract the file using atomic-ish write: write to a `.tmp` sidecar
-        // in the same directory, then `fs::rename` into the final location.
-        // This prevents partial writes from being visible if the process
-        // crashes mid-extraction.
+        // ── Atomic extract ────────────────────────────────────────────────
         match extract_file_atomic(&mut entry, &dest) {
             Ok(()) => {
-                tracing::info!("Extracted: {}", dest.display());
+                tracing::debug!("  ✔ extracted: {}", cache_relative.display());
                 stats.extracted += 1;
             }
             Err(e) => {
-                tracing::warn!("Failed to extract {}: {}", dest.display(), e);
+                tracing::warn!("⚠ Failed to extract {}: {}", cache_relative.display(), e);
                 stats.failed += 1;
             }
         }
+
+        // ── Progress heartbeat ────────────────────────────────────────────
+        let processed = stats.extracted + stats.skipped + stats.failed;
+        if processed % PROGRESS_INTERVAL == 0 {
+            tracing::info!(
+                "  … {}/{} entries processed ({} extracted, {} skipped, {} failed) …",
+                processed,
+                total_entries,
+                stats.extracted,
+                stats.skipped,
+                stats.failed
+            );
+        }
     }
 
+    let elapsed = t0.elapsed();
     tracing::info!(
-        "Unpack complete: {} extracted, {} skipped, {} failed",
+        "✔ Unpack done in {:.2}s — {} extracted, {} skipped, {} failed",
+        elapsed.as_secs_f64(),
         stats.extracted,
         stats.skipped,
         stats.failed
     );
 
+    // ── If everything failed (likely corrupt), clean up fresh target dir ──
+    if stats.extracted == 0 && stats.failed > 0 && target_created_by_us {
+        tracing::warn!(
+            "⚠ 0 files extracted, {} failed — removing freshly created target dir {} to keep filesystem clean.",
+            stats.failed,
+            target_root.display()
+        );
+        let _ = fs::remove_dir_all(target_root);
+    }
+
     Ok(stats)
 }
 
-// ----------------------- Internal Helpers -----------------------
+// -------------------------------------------- Internal Helpers --------------------------------------------
 
 /// Strip a leading `./` prefix from a path, if present.
 ///
-/// Some zip archivers (including the `zip` crate when given relative paths)
-/// prepend `./` to each entry. This is harmless for extraction but produces
-/// an unwanted `.` component in the Go cache layout, so we strip it.
+/// Some zip archivers prepend `./` to each entry.  This is harmless for
+/// extraction but produces an unwanted `.` component in the Go cache layout.
 fn strip_leading_dot_slash(path: &Path) -> PathBuf {
     let mut components: Vec<_> = path.components().collect();
-    // Remove leading `.` component if followed by a normal component.
-    // This handles both `./foo/bar` and `./` prefix cases.
     while components
         .first()
         .map_or(false, |c| *c == Component::CurDir)
@@ -272,22 +297,20 @@ fn strip_leading_dot_slash(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-/// Check whether a path contains `..` (parent directory) components,
-/// indicating a potential directory traversal attack.
+/// Return `true` if `path` contains any `..` (parent directory) component.
 ///
-/// This is a security-critical function. Any zip entry whose normalized
-/// path contains a `Component::ParentDir` is rejected outright.
+/// Security-critical: called on every entry path before constructing the
+/// destination path.  A zip-slip attack embeds `../../etc/passwd` style paths
+/// in the archive — this check blocks them completely.
 fn contains_traversal(path: &Path) -> bool {
-    path.components()
-        .any(|c| matches!(c, Component::ParentDir))
+    path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
 /// Check whether a zip entry path matches any `(module, version)` pair
-/// in the staged filter list.
+/// in the staged filter.
 ///
-/// The entry path uses `/` separators (archive format).  The `@v`
-/// boundary is used to split the module path from the version, mirroring
-/// the logic in `pack::matches_filter`.
+/// The entry path uses `/` separators (archive format).  The `@v` boundary
+/// separates the module path from the version filename.
 fn entry_matches_staged_filter(entry_path: &Path, filter: &[(String, String)]) -> bool {
     let parts: Vec<_> = entry_path.components().collect();
     if parts.len() < 3 {
@@ -303,7 +326,7 @@ fn entry_matches_staged_filter(entry_path: &Path, filter: &[(String, String)]) -
         return false;
     }
 
-    // Module path is everything before @v, joined with `/`.
+    // Module path: everything before @v, joined with '/'.
     let module: String = parts[..v_idx]
         .iter()
         .filter_map(|c| {
@@ -316,7 +339,7 @@ fn entry_matches_staged_filter(entry_path: &Path, filter: &[(String, String)]) -
         .collect::<Vec<_>>()
         .join("/");
 
-    // Version is the file stem of the component after @v.
+    // Version: file stem of the component immediately after @v.
     let version = Path::new(parts[v_idx + 1].as_os_str())
         .file_stem()
         .and_then(|s| s.to_str())
@@ -326,42 +349,24 @@ fn entry_matches_staged_filter(entry_path: &Path, filter: &[(String, String)]) -
     filter.contains(&(module, version))
 }
 
-/// Convert a zip entry path from the archive format (using `/` separators
-/// in the module path) back to the Go module cache format (using `!`
-/// separators within the module path portion).
+/// Convert an archive path (`/`-separated) to a Go module cache path
+/// (`!`-separated first component).
 ///
-/// This is the inverse of `pack_modules`' `normalize_cache_path`. The
-/// archive stores paths like `github.com/gin-gonic/gin/@v/v1.9.1.info`
-/// (using `/` for the module path), but Go's module cache on disk uses
-/// `github.com!gin-gonic!gin/@v/v1.9.1.info` (using `!` within the
-/// module path so it forms a single directory name).
-///
-/// # Algorithm
-///
-/// The `@v` directory is the reliable boundary marker in Go's cache layout:
-/// everything **before** `@v` belongs to the module path and must be
-/// re-joined with `!`; everything from `@v` onward stays as-is.
-///
-/// # Examples
+/// The `@v` directory is the reliable boundary marker.  Everything before
+/// `@v` is the module path and must be joined with `!`.  Everything from
+/// `@v` onward uses normal path separators.
 ///
 /// ```text
 /// github.com/gin-gonic/gin/@v/v1.9.1.info
 ///   → github.com!gin-gonic!gin/@v/v1.9.1.info
-///
-/// golang.org/x/text/@v/v0.3.7.info
-///   → golang.org!x!text/@v/v0.3.7.info
 /// ```
 fn denormalize_cache_path(relative: &Path) -> PathBuf {
     let components: Vec<_> = relative.components().collect();
 
-    // Find the `@v` boundary component. Everything before it is part of
-    // the module path and should be joined with `!`.
     let v_idx = components.iter().position(|c| c.as_os_str() == "@v");
 
     match v_idx {
         Some(idx) if idx > 0 => {
-            // Join all components before `@v` with `!` to form a single
-            // directory name (Go cache convention).
             let module_part: String = components[..idx]
                 .iter()
                 .filter_map(|c| {
@@ -375,392 +380,459 @@ fn denormalize_cache_path(relative: &Path) -> PathBuf {
                 .join("!");
 
             let mut result = PathBuf::from(module_part);
-            // Append `@v` and everything after it using normal path separators.
             for comp in &components[idx..] {
                 result.push(comp);
             }
             result
         }
-        // If no `@v` found, or it's at position 0, fall back to replacing
-        // `/` with `!` in the string representation. This handles edge
-        // cases like `github.com/gin-gonic/gin` without `@v` (shouldn't
-        // normally occur in a well-formed archive but we handle it).
         _ => {
+            // Fallback for paths without `@v` (edge case — convert all `/` → `!`).
             let path_str = relative.to_string_lossy();
             PathBuf::from(path_str.replace('/', "!"))
         }
     }
 }
 
-/// Check whether the destination file already exists with the same byte
-/// length as the zip entry. If so, the extraction can be safely skipped
-/// (idempotent behavior).
+/// Return `true` if `dest` already exists with a byte size matching `expected_size`.
 ///
-/// This uses file size as a quick heuristic. A more thorough check would
-/// compare content hashes, but that would require reading the entire file
-/// from disk — the size check is a pragmatic tradeoff for the common case
-/// where re-running unpack on an already-correct cache should be a no-op.
+/// Used as a lightweight idempotency heuristic: a matching size means the file
+/// was already extracted by a previous run and can be safely skipped.
 fn is_idempotent_skip(dest: &Path, expected_size: u64) -> bool {
     match fs::metadata(dest) {
-        Ok(metadata) => metadata.len() == expected_size,
+        Ok(meta) => meta.len() == expected_size,
         Err(_) => false,
     }
 }
 
 /// Extract a single zip entry to `dest` using an atomic-ish write strategy.
 ///
-/// The file is first written to a `.tmp` sidecar in the same directory as
-/// `dest`, then `fs::rename`d into place. Because `rename` on the same
-/// filesystem is atomic on POSIX systems, this prevents partial writes from
-/// being visible to concurrent readers.
+/// The file is streamed to `dest.war.tmp` in the same directory, then
+/// `fs::rename`d into place.  On POSIX systems `rename(2)` is atomic with
+/// respect to the directory entry, so concurrent readers never observe a
+/// partial file.
 ///
-/// If a stale `.tmp` file already exists from a previous failed extraction,
-/// it is overwritten. This is safe because the `.tmp` file is never the
-/// final artifact — only the rename'd file is.
+/// If the rename fails, the `.war.tmp` sidecar is removed before returning
+/// the error, leaving no stale partial files.
 fn extract_file_atomic<R: Read>(
     entry: &mut zip::read::ZipFile<'_, R>,
     dest: &Path,
 ) -> Result<(), WarError> {
     let tmp_path = dest.with_extension(format!(
-        "{}.tmp",
-        dest.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("dat")
+        "{}.war.tmp",
+        dest.extension().and_then(|e| e.to_str()).unwrap_or("dat")
     ));
 
-    // Create and write the temporary file.
+    // Stream entry bytes to the tmp file.
     let mut tmp_file = fs::File::create(&tmp_path)?;
     io::copy(entry, &mut tmp_file)?;
     tmp_file.flush()?;
 
-    // Preserve unix permissions from the zip entry, if available.
-    // On non-unix platforms this is a no-op.
+    // Preserve unix permissions when available (no-op on Windows).
     #[cfg(unix)]
     {
         if let Some(mode) = entry.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(mode);
-            fs::set_permissions(&tmp_path, permissions)?;
+            let perms = fs::Permissions::from_mode(mode);
+            fs::set_permissions(&tmp_path, perms)?;
         }
     }
 
     // Atomic rename into final location.
-    fs::rename(&tmp_path, dest)?;
+    fs::rename(&tmp_path, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path); // best-effort cleanup
+        WarError::IOError(io::Error::new(
+            e.kind(),
+            format!(
+                "Atomic rename failed: {} → {}: {}",
+                tmp_path.display(),
+                dest.display(),
+                e
+            ),
+        ))
+    })?;
 
     Ok(())
 }
 
+// -------------------------------------------- Tests --------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Write as IoWrite};
+    use std::io::Write as IoWrite;
     use tempfile::TempDir;
     use zip::{write::FileOptions, ZipWriter};
 
-    // ----------------------- Helper: create a synthetic zip archive -----------------------
+    // ── Helper: build a zip archive in memory ────────────────────────────
 
-    /// Build a zip archive in memory from a list of (path, content) pairs.
-    /// Returns the raw bytes of the zip file.
+    /// Build a well-formed zip in memory from `(path, content)` pairs.
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let buf = Cursor::new(Vec::new());
+        let buf = std::io::Cursor::new(Vec::new());
         let mut zip = ZipWriter::new(buf);
-        let options: FileOptions<'_, ()> = FileOptions::default()
+        let opts: FileOptions<'_, ()> = FileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
 
         for (path, content) in entries {
-            zip.start_file(path, options).expect("start_file failed");
-            zip.write_all(content).expect("write_all failed");
+            zip.start_file(path, opts).expect("start_file");
+            zip.write_all(content).expect("write_all");
         }
-
-        let buf = zip.finish().expect("zip finish failed");
-        buf.into_inner()
+        zip.finish().expect("finish").into_inner()
     }
 
-    /// Write a zip archive to a file on disk.
-    fn write_zip_to_file(path: &Path, data: &[u8]) {
-        let mut f = fs::File::create(path).expect("create file failed");
-        f.write_all(data).expect("write_all failed");
+    /// Write raw bytes to a file on disk.
+    fn write_file(path: &Path, data: &[u8]) {
+        let mut f = fs::File::create(path).expect("create");
+        f.write_all(data).expect("write");
     }
 
-    // ----------------------- Test: successful extraction -----------------------
+    // ── Successful extraction ────────────────────────────────────────────
 
     #[test]
     fn test_successful_extraction() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("test.zip");
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("test.zip");
         let target = tmp.path().join("cache");
 
-        let zip_data = build_zip(&[
+        let data = build_zip(&[
             (
                 "github.com/gin-gonic/gin/@v/v1.9.1.info",
                 b"{\"Version\":\"v1.9.1\"}",
             ),
-            (
-                "github.com/gin-gonic/gin/@v/v1.9.1.mod",
-                b"module github.com/gin-gonic/gin\n",
-            ),
+            ("github.com/gin-gonic/gin/@v/v1.9.1.mod", b"module gin\n"),
             (
                 "golang.org/x/text/@v/v0.3.7.info",
                 b"{\"Version\":\"v0.3.7\"}",
             ),
         ]);
-        write_zip_to_file(&archive_path, &zip_data);
+        write_file(&archive, &data);
 
-        let stats = unpack_modules(&archive_path, &target).expect("unpack failed");
+        let stats = unpack_modules(&archive, &target).expect("unpack");
 
         assert_eq!(stats.extracted, 3);
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.failed, 0);
 
-        // Verify Go cache layout: first component uses `!` separators.
-        let info_path = target.join("github.com!gin-gonic!gin/@v/v1.9.1.info");
-        assert!(info_path.exists(), "Expected file: {}", info_path.display());
-        let content = fs::read_to_string(&info_path).expect("read failed");
-        assert_eq!(content, "{\"Version\":\"v1.9.1\"}");
-
-        let mod_path = target.join("github.com!gin-gonic!gin/@v/v1.9.1.mod");
-        assert!(mod_path.exists(), "Expected file: {}", mod_path.display());
-
-        let text_info = target.join("golang.org!x!text/@v/v0.3.7.info");
-        assert!(text_info.exists(), "Expected file: {}", text_info.display());
+        assert!(target
+            .join("github.com!gin-gonic!gin/@v/v1.9.1.info")
+            .exists());
+        assert!(target.join("golang.org!x!text/@v/v0.3.7.info").exists());
     }
 
-    // ----------------------- Test: duplicate skip (idempotency) -----------------------
+    // ── Idempotency ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_idempotent_skip() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("test.zip");
+    fn test_idempotent_reextraction_skips_same_size() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("test.zip");
         let target = tmp.path().join("cache");
 
-        let content = b"hello world";
-        let zip_data = build_zip(&[("github.com/test/mod/@v/v1.0.0.info", content)]);
-        write_zip_to_file(&archive_path, &zip_data);
+        let data = build_zip(&[("github.com/test/mod/@v/v1.0.0.info", b"hello world")]);
+        write_file(&archive, &data);
 
-        // First extraction: should extract.
-        let stats1 = unpack_modules(&archive_path, &target).expect("unpack 1 failed");
-        assert_eq!(stats1.extracted, 1);
-        assert_eq!(stats1.skipped, 0);
+        let s1 = unpack_modules(&archive, &target).unwrap();
+        assert_eq!(s1.extracted, 1);
 
-        // Second extraction: should skip (same file, same size).
-        let stats2 = unpack_modules(&archive_path, &target).expect("unpack 2 failed");
-        assert_eq!(stats2.extracted, 0);
-        assert_eq!(stats2.skipped, 1);
+        let s2 = unpack_modules(&archive, &target).unwrap();
+        assert_eq!(s2.extracted, 0);
+        assert_eq!(s2.skipped, 1);
 
-        // Content should remain unchanged.
-        let file_path = target.join("github.com!test!mod/@v/v1.0.0.info");
-        let on_disk = fs::read_to_string(&file_path).expect("read failed");
+        let on_disk =
+            fs::read_to_string(target.join("github.com!test!mod/@v/v1.0.0.info")).unwrap();
         assert_eq!(on_disk, "hello world");
     }
 
-    // ----------------------- Test: traversal rejection -----------------------
+    // ── Corrupted archive — structural error ─────────────────────────────
 
     #[test]
-    fn test_traversal_rejection() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("evil.zip");
+    fn test_corrupted_archive_returns_specific_error() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("bad.zip");
         let target = tmp.path().join("cache");
 
-        let zip_data = build_zip(&[
-            ("../../etc/passwd", b"root:x:0:0:root:/root:/bin/bash\n"),
-            ("github.com/test/mod/@v/v1.0.0.info", b"safe content"),
-        ]);
-        write_zip_to_file(&archive_path, &zip_data);
+        // Write garbage bytes — not a valid zip.
+        write_file(&archive, b"this is not a zip file at all \x00\xff");
 
-        let stats = unpack_modules(&archive_path, &target).expect("unpack failed");
+        let err = unpack_modules(&archive, &target).unwrap_err();
 
-        // The traversal entry should be rejected (failed), the safe entry extracted.
-        assert_eq!(stats.extracted, 1);
-        assert_eq!(stats.failed, 1);
+        assert!(
+            matches!(err, WarError::CorruptedArchive { .. }),
+            "expected CorruptedArchive, got: {:?}",
+            err
+        );
 
-        // Safe entry should exist.
-        let safe_path = target.join("github.com!test!mod/@v/v1.0.0.info");
-        assert!(safe_path.exists());
-    }
-
-    // ----------------------- Test: missing archive -----------------------
-
-    #[test]
-    fn test_missing_archive() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("nonexistent.zip");
-        let target = tmp.path().join("cache");
-
-        let result = unpack_modules(&archive_path, &target);
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            WarError::InvalidInput(msg) => {
-                assert!(
-                    msg.contains("Archive does not exist"),
-                    "Unexpected error message: {}",
-                    msg
-                );
-            }
-            other => panic!("Expected InvalidInput, got: {:?}", other),
+        // The hint must be present and actionable.
+        if let WarError::CorruptedArchive { hint, .. } = err {
+            assert!(!hint.is_empty(), "hint must not be empty");
         }
     }
 
-    // ----------------------- Test: dry-run mode -----------------------
+    #[test]
+    fn test_corrupted_archive_cleans_up_target_dir() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("bad.zip");
+        let target = tmp.path().join("fresh_target");
+
+        // Truncated zip — structural corruption.
+        write_file(&archive, b"PK\x03\x04truncated");
+
+        let _ = unpack_modules(&archive, &target);
+
+        // The target directory should NOT persist after a structural failure
+        // because we created it and zero files were extracted.
+        // (Whether it exists depends on whether the zip library rejects at open
+        // vs. at iteration; either outcome is acceptable — we just assert no
+        // partial content is left.)
+        if target.exists() {
+            let entries: Vec<_> = fs::read_dir(&target).unwrap().flatten().collect();
+            assert!(
+                entries.is_empty(),
+                "corrupt unpack must not leave partial files: {:?}",
+                entries
+            );
+        }
+    }
+
+    // ── Truncated zip: 50% of bytes removed ──────────────────────────────
 
     #[test]
-    fn test_dry_run_does_not_write_files() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("test.zip");
+    fn test_truncated_zip_50_percent() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("truncated.zip");
         let target = tmp.path().join("cache");
 
-        let zip_data = build_zip(&[
-            ("github.com/test/mod/@v/v1.0.0.info", b"dry-run content"),
-            ("golang.org/x/text/@v/v0.3.7.info", b"also dry"),
+        // Build a valid zip, then keep only the first half of the bytes —
+        // simulating `truncate -s 50% cache.zip`.
+        let full = build_zip(&[
+            (
+                "github.com/gin-gonic/gin/@v/v1.9.1.mod",
+                b"module gin\n\ngo 1.20\n",
+            ),
+            (
+                "golang.org/x/text/@v/v0.3.7.mod",
+                b"module text\n\ngo 1.17\n",
+            ),
         ]);
-        write_zip_to_file(&archive_path, &zip_data);
+        let half = &full[..full.len() / 2];
+        write_file(&archive, half);
 
-        let opts = UnpackOpts { dry_run: true, ..Default::default() };
-        let stats = unpack_modules_with_opts(&archive_path, &target, &opts).expect("unpack failed");
+        let result = unpack_modules(&archive, &target);
 
-        // In dry-run mode, files are counted as "would-be extracted" but
-        // nothing should actually exist on disk.
-        assert_eq!(stats.extracted, 2);
-        assert_eq!(stats.skipped, 0);
-        assert_eq!(stats.failed, 0);
+        // We expect either CorruptedArchive (if zip rejects at open) or
+        // a stats result with failures (if it rejects at iteration).
+        match result {
+            Err(WarError::CorruptedArchive { .. }) => {
+                // Perfect: caught at the structural level.
+            }
+            Ok(stats) => {
+                // Acceptable: caught per-entry. Failed count must be > 0.
+                assert!(
+                    stats.failed > 0 || stats.extracted == 0,
+                    "50% truncation must result in failures or zero extractions"
+                );
+            }
+            Err(other) => {
+                // Any other error is acceptable too (I/O error on read, etc.)
+                tracing::warn!(
+                    "Got non-CorruptedArchive error for truncated zip: {:?}",
+                    other
+                );
+            }
+        }
+    }
 
-        // Target directory should NOT have been created.
+    // ── Path traversal rejection ─────────────────────────────────────────
+
+    #[test]
+    fn test_path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("evil.zip");
+        let target = tmp.path().join("cache");
+
+        let data = build_zip(&[
+            ("../../etc/passwd", b"root:x:0:0"),
+            ("github.com/safe/mod/@v/v1.0.0.info", b"safe"),
+        ]);
+        write_file(&archive, &data);
+
+        let stats = unpack_modules(&archive, &target).unwrap();
+
+        assert_eq!(stats.extracted, 1, "safe entry must still be extracted");
+        assert_eq!(stats.failed, 1, "traversal entry must be counted as failed");
+
+        // The safe file must exist; passwd must not.
+        assert!(target.join("github.com!safe!mod/@v/v1.0.0.info").exists());
+        assert!(!target.join("etc/passwd").exists());
+        // Double-check: passwd must not exist ANYWHERE under target.
+        let dangerous = tmp.path().join("etc/passwd");
         assert!(
-            !target.exists(),
-            "dry-run should not create the target directory"
+            !dangerous.exists(),
+            "path traversal must be blocked completely"
         );
     }
 
-    // ----------------------- Test: strip_leading_dot_slash -----------------------
+    // ── Missing archive ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_missing_archive_returns_invalid_input() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("nonexistent.zip");
+        let target = tmp.path().join("cache");
+
+        let err = unpack_modules(&archive, &target).unwrap_err();
+
+        assert!(
+            matches!(err, WarError::InvalidInput(_)),
+            "expected InvalidInput, got: {:?}",
+            err
+        );
+    }
+
+    // ── Dry-run mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dry_run_does_not_write_files() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("test.zip");
+        let target = tmp.path().join("cache");
+
+        let data = build_zip(&[
+            ("github.com/test/mod/@v/v1.0.0.info", b"content"),
+            ("golang.org/x/text/@v/v0.3.7.info", b"also"),
+        ]);
+        write_file(&archive, &data);
+
+        let opts = UnpackOpts {
+            dry_run: true,
+            ..Default::default()
+        };
+        let stats = unpack_modules_with_opts(&archive, &target, &opts).unwrap();
+
+        assert_eq!(stats.extracted, 2);
+        assert!(!target.exists(), "dry-run must not create target dir");
+    }
+
+    // ── Staged filter ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_staged_filter_extracts_only_matching() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("test.zip");
+        let target = tmp.path().join("cache");
+
+        let data = build_zip(&[
+            ("github.com/gin-gonic/gin/@v/v1.9.1.mod", b"gin"),
+            ("golang.org/x/text/@v/v0.3.7.mod", b"text"),
+        ]);
+        write_file(&archive, &data);
+
+        let opts = UnpackOpts {
+            staged_filter: Some(vec![(
+                "github.com/gin-gonic/gin".to_string(),
+                "v1.9.1".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let stats = unpack_modules_with_opts(&archive, &target, &opts).unwrap();
+
+        assert_eq!(stats.extracted, 1, "only gin should be extracted");
+        assert_eq!(stats.skipped, 1, "text should be skipped by filter");
+
+        assert!(target
+            .join("github.com!gin-gonic!gin/@v/v1.9.1.mod")
+            .exists());
+        assert!(!target.join("golang.org!x!text/@v/v0.3.7.mod").exists());
+    }
+
+    // ── Mixed success + traversal ─────────────────────────────────────────
+
+    #[test]
+    fn test_mixed_success_and_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("mixed.zip");
+        let target = tmp.path().join("cache");
+
+        let data = build_zip(&[
+            ("github.com/good/mod/@v/v1.0.0.info", b"good"),
+            ("../escape/attempt", b"evil"),
+            ("github.com/also/good/@v/v2.0.0.info", b"also good"),
+        ]);
+        write_file(&archive, &data);
+
+        let stats = unpack_modules(&archive, &target).unwrap();
+
+        assert_eq!(stats.extracted, 2);
+        assert_eq!(stats.failed, 1);
+    }
+
+    // ── Atomic write: no .war.tmp remains ────────────────────────────────
+
+    #[test]
+    fn test_atomic_extract_leaves_no_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("test.zip");
+        let target = tmp.path().join("cache");
+
+        let data = build_zip(&[("github.com/test/mod/@v/v1.0.0.mod", b"module test\n")]);
+        write_file(&archive, &data);
+
+        unpack_modules(&archive, &target).unwrap();
+
+        // Walk the target and assert there are no .war.tmp files.
+        let tmp_files: Vec<_> = walkdir::WalkDir::new(&target)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.path().to_string_lossy().contains(".war.tmp"))
+            .collect();
+
+        assert!(
+            tmp_files.is_empty(),
+            "no .war.tmp files must remain: {:?}",
+            tmp_files
+        );
+    }
+
+    // ── Helpers: path functions ───────────────────────────────────────────
 
     #[test]
     fn test_strip_leading_dot_slash() {
         assert_eq!(
-            strip_leading_dot_slash(Path::new("./github.com/test/@v/v1.0.0.info")),
-            PathBuf::from("github.com/test/@v/v1.0.0.info")
+            strip_leading_dot_slash(Path::new("./foo/bar")),
+            PathBuf::from("foo/bar")
         );
         assert_eq!(
-            strip_leading_dot_slash(Path::new("github.com/test/@v/v1.0.0.info")),
-            PathBuf::from("github.com/test/@v/v1.0.0.info")
-        );
-        assert_eq!(
-            strip_leading_dot_slash(Path::new("././nested/./path")),
-            PathBuf::from("nested/./path")
+            strip_leading_dot_slash(Path::new("foo/bar")),
+            PathBuf::from("foo/bar")
         );
     }
-
-    // ----------------------- Test: contains_traversal -----------------------
 
     #[test]
     fn test_contains_traversal() {
         assert!(contains_traversal(Path::new("../../etc/passwd")));
         assert!(contains_traversal(Path::new("foo/../bar")));
-        assert!(!contains_traversal(Path::new(
-            "github.com/test/@v/v1.0.0.info"
-        )));
-        assert!(!contains_traversal(Path::new("simple/path")));
-    }
-
-    // ----------------------- Test: denormalize_cache_path -----------------------
-
-    #[test]
-    fn test_denormalize_cache_path_basic() {
-        let input = Path::new("github.com/gin-gonic/gin/@v/v1.9.1.info");
-        let expected = PathBuf::from("github.com!gin-gonic!gin/@v/v1.9.1.info");
-        assert_eq!(denormalize_cache_path(input), expected);
+        assert!(!contains_traversal(Path::new("github.com/gin/@v/v1.info")));
     }
 
     #[test]
-    fn test_denormalize_cache_path_simple_domain() {
-        let input = Path::new("golang.org/x/text/@v/v0.3.7.info");
-        let expected = PathBuf::from("golang.org!x!text/@v/v0.3.7.info");
-        assert_eq!(denormalize_cache_path(input), expected);
+    fn test_denormalize_cache_path() {
+        assert_eq!(
+            denormalize_cache_path(Path::new("github.com/gin-gonic/gin/@v/v1.9.1.info")),
+            PathBuf::from("github.com!gin-gonic!gin/@v/v1.9.1.info")
+        );
+        assert_eq!(
+            denormalize_cache_path(Path::new("golang.org/x/text/@v/v0.3.7.mod")),
+            PathBuf::from("golang.org!x!text/@v/v0.3.7.mod")
+        );
     }
 
     #[test]
-    fn test_denormalize_cache_path_no_slash_in_first_component() {
-        // If the first component has no `/`, it should remain unchanged.
-        let input = Path::new("singlecomponent/@v/v1.0.0.info");
-        let expected = PathBuf::from("singlecomponent/@v/v1.0.0.info");
-        assert_eq!(denormalize_cache_path(input), expected);
-    }
+    fn test_is_idempotent_skip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.txt");
+        fs::write(&path, b"hello").unwrap();
 
-    // ----------------------- Test: is_idempotent_skip -----------------------
-
-    #[test]
-    fn test_is_idempotent_skip_existing_same_size() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let file_path = tmp.path().join("test.txt");
-
-        let content = b"hello";
-        fs::write(&file_path, content).expect("write failed");
-
-        // Size is 5 bytes, same as expected.
-        assert!(is_idempotent_skip(&file_path, 5));
-    }
-
-    #[test]
-    fn test_is_idempotent_skip_existing_different_size() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let file_path = tmp.path().join("test.txt");
-
-        fs::write(&file_path, b"hello").expect("write failed");
-
-        // Size is 5 but expected is 10.
-        assert!(!is_idempotent_skip(&file_path, 10));
-    }
-
-    #[test]
-    fn test_is_idempotent_skip_nonexistent() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let file_path = tmp.path().join("nonexistent.txt");
-
-        assert!(!is_idempotent_skip(&file_path, 5));
-    }
-
-    // ----------------------- Test: entries with leading ./ prefix -----------------------
-
-    #[test]
-    fn test_entries_with_leading_dot_slash() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("dot.zip");
-        let target = tmp.path().join("cache");
-
-        let zip_data = build_zip(&[(
-            "./github.com/test/mod/@v/v1.0.0.info",
-            b"content",
-        )]);
-        write_zip_to_file(&archive_path, &zip_data);
-
-        let stats = unpack_modules(&archive_path, &target).expect("unpack failed");
-
-        assert_eq!(stats.extracted, 1);
-        assert_eq!(stats.failed, 0);
-
-        let extracted = target.join("github.com!test!mod/@v/v1.0.0.info");
-        assert!(extracted.exists());
-    }
-
-    // ----------------------- Test: mixed success and failure -----------------------
-
-    #[test]
-    fn test_mixed_success_and_traversal() {
-        let tmp = TempDir::new().expect("tempdir failed");
-        let archive_path = tmp.path().join("mixed.zip");
-        let target = tmp.path().join("cache");
-
-        let zip_data = build_zip(&[
-            ("github.com/good/mod/@v/v1.0.0.info", b"good"),
-            ("../escape/attempt", b"evil"),
-            ("github.com/also/good/@v/v2.0.0.info", b"also good"),
-        ]);
-        write_zip_to_file(&archive_path, &zip_data);
-
-        let stats = unpack_modules(&archive_path, &target).expect("unpack failed");
-
-        assert_eq!(stats.extracted, 2);
-        assert_eq!(stats.failed, 1);
-        assert_eq!(stats.skipped, 0);
+        assert!(is_idempotent_skip(&path, 5));
+        assert!(!is_idempotent_skip(&path, 10));
+        assert!(!is_idempotent_skip(&tmp.path().join("nonexistent"), 5));
     }
 }

@@ -62,7 +62,6 @@ pub struct VerifyReport {
     /// All findings produced during verification (ok, warning, and error).
     pub findings: Vec<Finding>,
 }
-
 impl VerifyReport {
     /// `true` if every finding has severity `Ok`.
     pub fn is_ok(&self) -> bool {
@@ -413,8 +412,10 @@ fn log_finding(f: &Finding) {
     }
 }
 
+// -------------------------------------------- Tests --------------------------------------------
+
 #[cfg(test)]
-mod verify_tests {
+mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;

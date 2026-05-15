@@ -277,8 +277,10 @@ fn normalize_cache_path(relative: &Path) -> String {
     out
 }
 
+// -------------------------------------------- Tests --------------------------------------------
+
 #[cfg(test)]
-mod pack_tests {
+mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;

@@ -77,7 +77,7 @@ pub struct SyncResult {
     pub warnings: Vec<CollisionWarning>,
 }
 
-// -------------------------------------------- Public Functions --------------------------------------------
+// -------------------------------------------- Public API --------------------------------------------
 
 /// Synchronise `~/.war/cache/go` → native Go module cache (`$GOMODCACHE`).
 ///
@@ -102,6 +102,13 @@ pub struct SyncResult {
 /// Returns `WarError::InvalidInput` if `src_root` does not exist.
 /// Returns `WarError::IOError` if the destination root cannot be created.
 pub fn sync_cache(src_root: &Path, dst_root: &Path) -> Result<SyncResult, WarError> {
+    let span = tracing::info_span!(
+        "sync_cache",
+        src = %src_root.display(),
+        dst = %dst_root.display(),
+    );
+    let _enter = span.enter();
+
     if !src_root.exists() {
         return Err(WarError::InvalidInput(format!(
             "War cache source does not exist: {}\n\
@@ -110,6 +117,7 @@ pub fn sync_cache(src_root: &Path, dst_root: &Path) -> Result<SyncResult, WarErr
         )));
     }
 
+    let t0 = std::time::Instant::now();
     tracing::info!(
         "(◕‿◕✿) Starting sync: {} → {}",
         src_root.display(),
@@ -164,17 +172,16 @@ pub fn sync_cache(src_root: &Path, dst_root: &Path) -> Result<SyncResult, WarErr
 
         match sync_single_file(src_path, &dst_path) {
             Ok(FileOutcome::Copied) => {
-                tracing::info!("✔ Copied: {}", relative.display());
+                tracing::debug!("  ✔ copied: {}", relative.display());
                 result.stats.copied += 1;
             }
             Ok(FileOutcome::Skipped) => {
-                tracing::debug!("– Skipped (already up-to-date): {}", relative.display());
+                tracing::debug!("  – skipped (up-to-date): {}", relative.display());
                 result.stats.skipped += 1;
             }
             Ok(FileOutcome::Collision(warning)) => {
                 tracing::warn!(
-                    "⚠ Collision detected at {} — source hash {} ≠ destination hash {}. \
-                     Skipping to protect existing file.",
+                    "  ⚠ collision: {} — src {} ≠ dst {}. Skipping to protect existing file.",
                     relative.display(),
                     warning.source_hash,
                     warning.destination_hash
@@ -183,14 +190,31 @@ pub fn sync_cache(src_root: &Path, dst_root: &Path) -> Result<SyncResult, WarErr
                 result.warnings.push(warning);
             }
             Err(e) => {
-                tracing::warn!("⚠ Failed to copy {}: {}", relative.display(), e);
+                tracing::warn!("  ⚠ failed to copy {}: {}", relative.display(), e);
                 result.stats.failed += 1;
             }
         }
+
+        // Progress heartbeat every 50 files.
+        let processed = result.stats.copied
+            + result.stats.skipped
+            + result.stats.collisions
+            + result.stats.failed;
+        if processed % 50 == 0 && processed > 0 {
+            tracing::info!(
+                "  … {} files processed ({} copied, {} skipped, {} collisions) …",
+                processed,
+                result.stats.copied,
+                result.stats.skipped,
+                result.stats.collisions
+            );
+        }
     }
 
+    let elapsed = t0.elapsed();
     tracing::info!(
-        "(≧◡≦) Sync complete: {} copied, {} skipped, {} collisions, {} failed",
+        "(≧◡≦) Sync complete in {:.2}s — {} copied, {} skipped, {} collisions, {} failed",
+        elapsed.as_secs_f64(),
         result.stats.copied,
         result.stats.skipped,
         result.stats.collisions,
@@ -394,7 +418,6 @@ struct Sha256 {
     buf_len: usize,
     total_bits: u64,
 }
-
 impl Sha256 {
     /// SHA-256 initial hash values (first 32 bits of fractional parts of √primes).
     const H: [u32; 8] = [
@@ -559,9 +582,12 @@ fn hex_nibble(n: u8) -> u8 {
     }
 }
 
+// -------------------------------------------- Tests --------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as IoWrite;
     use tempfile::TempDir;
 
     // ---- Helper: build a minimal war cache tree ----
