@@ -80,7 +80,7 @@ pub struct StagedModule {
 }
 
 /// Go-specific configuration tracked in war.lock.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize, Default, Debug, Serialize)]
 pub struct GoConfig {
     /// Path to the last-used vendor directory.
     pub last_vendor_path: Option<PathBuf>,
@@ -93,17 +93,6 @@ pub struct GoConfig {
     /// Persisted to `~/.war/war.lock` on every mutation.
     #[serde(default)]
     pub staged_modules: Vec<StagedModule>,
-}
-
-impl Default for GoConfig {
-    fn default() -> Self {
-        Self {
-            last_vendor_path: None,
-            last_sync_timestamp: None,
-            go_version: None,
-            staged_modules: Vec::new(),
-        }
-    }
 }
 
 /// Rust-specific configuration (placeholder for future war-rust crate).

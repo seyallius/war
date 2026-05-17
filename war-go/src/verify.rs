@@ -385,10 +385,7 @@ fn count_info_files(root: &Path) -> usize {
         .flatten()
         .filter(|e| {
             e.file_type().is_file()
-                && e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map_or(false, |ext| ext == "info")
+                && (e.path().extension().and_then(|ext| ext.to_str()) == Some("info"))
         })
         .count()
 }

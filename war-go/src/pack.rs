@@ -102,10 +102,10 @@ pub async fn pack_modules(
 
     for entry in WalkDir::new(cache_root) {
         let entry = entry.map_err(|e| {
-            WarError::IOError(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to walk cache directory: {}", e),
-            ))
+            WarError::IOError(io::Error::other(format!(
+                "Failed to walk cache directory: {}",
+                e
+            )))
         })?;
 
         let path = entry.path();
@@ -146,7 +146,7 @@ pub async fn pack_modules(
         file_count += 1;
 
         // Progress heartbeat every N files.
-        if file_count % PROGRESS_INTERVAL == 0 {
+        if file_count.is_multiple_of(PROGRESS_INTERVAL) {
             tracing::info!("  … {} files added to archive so far …", file_count);
         }
     }
@@ -279,7 +279,7 @@ fn normalize_cache_path(relative: &Path) -> String {
         .components()
         .map(|c| c.as_os_str().to_string_lossy());
     let first = parts.next().unwrap_or_default().replace("!", "/");
-    let mut out = String::from(first);
+    let mut out = first;
     for p in parts {
         out.push('/');
         out.push_str(&p);

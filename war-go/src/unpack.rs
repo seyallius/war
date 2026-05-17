@@ -246,7 +246,7 @@ pub fn unpack_modules_with_opts(
 
         // ── Progress heartbeat ────────────────────────────────────────────
         let processed = stats.extracted + stats.skipped + stats.failed;
-        if processed % PROGRESS_INTERVAL == 0 {
+        if processed.is_multiple_of(PROGRESS_INTERVAL) {
             tracing::info!(
                 "  … {}/{} entries processed ({} extracted, {} skipped, {} failed) …",
                 processed,
@@ -288,10 +288,7 @@ pub fn unpack_modules_with_opts(
 /// extraction but produces an unwanted `.` component in the Go cache layout.
 fn strip_leading_dot_slash(path: &Path) -> PathBuf {
     let mut components: Vec<_> = path.components().collect();
-    while components
-        .first()
-        .map_or(false, |c| *c == Component::CurDir)
-    {
+    while components.first().is_some_and(|c| *c == Component::CurDir) {
         components.remove(0);
     }
     components.iter().collect()
