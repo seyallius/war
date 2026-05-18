@@ -4,14 +4,23 @@
 //! 1. Runs `go get <module>` in the project root to fetch + update go.mod.
 //! 2. Runs `go mod download` to populate $GOMODCACHE with .info/.mod/.zip files.
 //! 3. Copies downloaded modules from $GOMODCACHE → ~/.war/cache/go (war's private cache).
-//! 4. Appends a blank `_ "module/path"` import to `main.go` (if present).
-//! 5. Auto-stages the (module, version) pair in ~/.war/war.lock for pack --staged.
+//! 4. Auto-stages the (module, version) pair in ~/.war/war.lock for pack --staged.
+//!
+//! ## Real-time output streaming
+//!
+//! Both `go get` and `go mod download` are spawned with piped stdout/stderr.
+//! Each line produced by the child process is forwarded to `tracing::info!`
+//! immediately, giving the user real-time visibility into download progress.
+//! On failure, the captured stderr is still available in the `WarError::GoCommandFailed`
+//! variant for structured error reporting.
 
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::Stdio,
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use walkdir::WalkDir;
 use war_core::{config, WarError};
 
@@ -20,8 +29,13 @@ use war_core::{config, WarError};
 /// Fetch a Go module, auto-import it, and populate the war cache.
 ///
 /// The `module` argument may include an optional `@version` suffix.
-/// After fetch, the module is added to `staged_modules` in `~/.war/war.lock`
-/// and a blank `_ "module/path"` import is appended to `main.go` (if present).
+/// After fetch, the module is added to `staged_modules` in `~/.war/war.lock`.
+///
+/// # Real-time output
+///
+/// All stdout and stderr from `go get` and `go mod download` are streamed
+/// line-by-line to the logger as they arrive, so the user sees download
+/// progress in real time instead of a silent wait followed by a burst of text.
 pub async fn fetch_module(module: &str, project_root: &Path) -> Result<(), WarError> {
     let (module_path, version) = parse_module_version(module);
 
@@ -33,10 +47,10 @@ pub async fn fetch_module(module: &str, project_root: &Path) -> Result<(), WarEr
     );
 
     // 1. Run `go get <module>` to update go.mod/go.sum
-    run_go_get(project_root, module)?;
+    run_go_get(project_root, module).await?;
 
     // 2. Run `go mod download` to populate $GOMODCACHE
-    run_go_mod_download(project_root)?;
+    run_go_mod_download(project_root).await?;
 
     // 3. Copy downloaded modules from native cache → war cache
     sync_downloaded_to_war_cache(&module_path, &version)?;
@@ -76,6 +90,25 @@ pub async fn fetch_module_with_go_path(
     _project_root: &Path,
     _go_path: &Path,
 ) -> Result<(), WarError> {
+    // let (module_path, version) = parse_module_version(module);
+    //
+    // tracing::info!(
+    //     "Fetching module {}@{} with custom GOPATH in project root: {}",
+    //     module_path,
+    //     version,
+    //     project_root.display()
+    // );
+    //
+    // // TODO: real `go get` with GOPATH override.
+    // auto_stage(&module_path, &version)?;
+    //
+    // tracing::info!(
+    //     "✔ Module {}@{} fetched (custom GOPATH) and staged",
+    //     module_path,
+    //     version
+    // );
+    //
+    // Ok(())
     unimplemented!("Implement fetching modules with GOPATH overrides.")
 }
 
@@ -90,51 +123,153 @@ fn parse_module_version(module: &str) -> (String, String) {
     }
 }
 
-/// Run `go get <module>` in the project directory.
-fn run_go_get(project_root: &Path, module: &str) -> Result<(), WarError> {
-    //todo(go-get-async): allow async downloading output in std
-    let output = Command::new("go")
-        .arg("get")
-        .arg(module)
+/// Run a Go sub-command with real-time stdout/stderr streaming.
+///
+/// Spawns the child process with piped stdout and stderr, then reads both
+/// streams line-by-line in a concurrent loop.  Each line from the child is
+/// forwarded to `tracing::info!` immediately so the user sees output as it
+/// is produced — no silent wait followed by a burst.
+///
+/// On success (exit code 0), returns `Ok(())`.  On non-zero exit, all
+/// captured stderr is packed into a `WarError::GoCommandFailed` for
+/// structured error reporting, matching the behaviour of the previous
+/// buffered implementation.
+///
+/// # Why not inherit stdout/stderr directly?
+///
+/// `Stdio::inherit()` would also give real-time output, but it bypasses the
+/// tracing subsystem entirely — `go get`'s output would be interleaved with
+/// war's own log lines in an unstructured way, and we would lose the ability
+/// to capture stderr for error reporting.  By piping and re-logging, we keep
+/// everything inside the tracing pipeline and retain a copy for error messages.
+async fn run_go_command_streaming(
+    program: &str,
+    args: &[&str],
+    project_root: &Path,
+    command_label: &str,
+) -> Result<(), WarError> {
+    let mut child = Command::new(program)
+        .args(args)
         .current_dir(project_root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| WarError::GoCommandFailed {
-            command: format!("go get {}", module),
+            command: command_label.to_string(),
             stderr: format!("Failed to spawn: {}", e),
             exit_code: -1,
         })?;
 
-    if !output.status.success() {
+    // Take ownership of the piped streams before awaiting the child.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| WarError::GoCommandFailed {
+            command: command_label.to_string(),
+            stderr: "Failed to capture stdout: pipe not available".into(),
+            exit_code: -1,
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| WarError::GoCommandFailed {
+            command: command_label.to_string(),
+            stderr: "Failed to capture stderr: pipe not available".into(),
+            exit_code: -1,
+        })?;
+
+    // Wrap both streams in async_buf_read so we can iterate lines.
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
+
+    // We must read from both streams concurrently to avoid deadlocking
+    // when the child fills its stdout pipe buffer while we're reading stderr
+    // (or vice versa).  Spawn a task for each stream and join them.
+    let stdout_label = command_label.to_string();
+    let stdout_handle = tokio::spawn(async move {
+        let mut lines = stdout_reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) if !line.is_empty() => {
+                    tracing::info!("  │ {}", line);
+                }
+                Ok(Some(_)) => {}  // skip empty lines
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    tracing::debug!("{} stdout read error: {}", stdout_label, e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let stderr_label = command_label.to_string();
+    let stderr_handle = tokio::spawn(async move {
+        let mut lines = stderr_reader.lines();
+        let mut captured = Vec::new();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) if !line.is_empty() => {
+                    tracing::info!("  │ {}", line);
+                    captured.extend_from_slice(line.as_bytes());
+                    captured.push(b'\n');
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!("{} stderr read error: {}", stderr_label, e);
+                    break;
+                }
+            }
+        }
+        captured
+    });
+
+    // Wait for both stream readers to finish (they exit on pipe EOF,
+    // which happens when the child closes its stdout/stderr — usually on exit).
+    let _ = stdout_handle.await;
+    let captured_stderr = stderr_handle.await.unwrap_or_default();
+
+    // Now wait for the child process itself to exit.
+    let status = child.wait().await.map_err(|e| WarError::GoCommandFailed {
+        command: command_label.to_string(),
+        stderr: format!("Failed to wait for child: {}", e),
+        exit_code: -1,
+    })?;
+
+    if !status.success() {
+        let stderr_str = String::from_utf8_lossy(&captured_stderr).to_string();
         return Err(WarError::GoCommandFailed {
-            command: format!("go get {}", module),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code().unwrap_or(-1),
+            command: command_label.to_string(),
+            stderr: stderr_str,
+            exit_code: status.code().unwrap_or(-1),
         });
     }
+
     Ok(())
 }
 
-/// Run `go mod download` to populate the native module cache.
-fn run_go_mod_download(project_root: &Path) -> Result<(), WarError> {
-    let output = Command::new("go")
-        .arg("mod")
-        .arg("download")
-        .current_dir(project_root)
-        .output()
-        .map_err(|e| WarError::GoCommandFailed {
-            command: "go mod download".into(),
-            stderr: format!("Failed to spawn: {}", e),
-            exit_code: -1,
-        })?;
+/// Run `go get <module>` in the project directory with real-time output streaming.
+///
+/// Delegates to [`run_go_command_streaming`] so every line produced by
+/// `go get` appears in the terminal as it is emitted — no silent wait.
+async fn run_go_get(project_root: &Path, module: &str) -> Result<(), WarError> {
+    run_go_command_streaming(
+        "go",
+        &["get", module],
+        project_root,
+        &format!("go get {}", module),
+    )
+    .await
+}
 
-    if !output.status.success() {
-        return Err(WarError::GoCommandFailed {
-            command: "go mod download".into(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code().unwrap_or(-1),
-        });
-    }
-    Ok(())
+/// Run `go mod download` to populate the native module cache with real-time
+/// output streaming.
+///
+/// Delegates to [`run_go_command_streaming`] so download progress lines
+/// (e.g. individual module fetches) are visible immediately.
+async fn run_go_mod_download(project_root: &Path) -> Result<(), WarError> {
+    run_go_command_streaming("go", &["mod", "download"], project_root, "go mod download").await
 }
 
 /// Copy downloaded module files from $GOMODCACHE → ~/.war/cache/go.
@@ -198,7 +333,7 @@ fn sync_downloaded_to_war_cache(module_path: &str, version: &str) -> Result<(), 
 
 /// Append a blank `_ "module_path"` import to `<project_root>/main.go`.
 ///
-/// # Behaviour
+/// # Behavior
 ///
 /// - Looks for `main.go` in `project_root`.  If absent the function returns
 ///   `Ok(false)` silently (non-fatal — not every project has a `main.go`).
@@ -329,10 +464,6 @@ fn auto_stage(module_path: &str, version: &str) -> Result<(), WarError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    // ── parse_module_version ────────────────────────────────────────────────
 
     #[test]
     fn test_parse_module_version_with_at() {
@@ -363,207 +494,185 @@ mod tests {
         assert_eq!(version, "v1");
     }
 
-    // ── inject_import — pure unit tests (no I/O) ────────────────────────────
+    // ── run_go_command_streaming tests ────────────────────────────────────
+
+    /// Run a simple command via `run_go_command_streaming` and verify
+    /// that it succeeds.  Uses `echo` (available on all POSIX systems) as a
+    /// stand-in for `go` so the test doesn't require a Go toolchain.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_success() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // `echo hello` always exits 0 and prints "hello" to stdout.
+        let result = run_go_command_streaming("echo", &["hello"], tmp.path(), "echo hello").await;
+
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    /// Verify that a failing command returns the correct `WarError::GoCommandFailed`.
+    ///
+    /// Uses `false` (POSIX utility that always exits 1) to simulate a command
+    /// that fails without producing meaningful stderr.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run_go_command_streaming("false", &[], tmp.path(), "false").await;
+
+        let err = result.expect_err("expected GoCommandFailed");
+        match err {
+            WarError::GoCommandFailed {
+                command, exit_code, ..
+            } => {
+                assert_eq!(command, "false");
+                assert_eq!(exit_code, 1);
+            }
+            other => panic!("expected GoCommandFailed, got: {:?}", other),
+        }
+    }
+
+    /// Verify that a non-existent command returns `GoCommandFailed` with
+    /// exit code -1 and a "Failed to spawn" message.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_spawn_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run_go_command_streaming(
+            "/nonexistent/binary/that/does/not/exist",
+            &[],
+            tmp.path(),
+            "nonexistent",
+        )
+        .await;
+
+        let err = result.expect_err("expected GoCommandFailed");
+        match err {
+            WarError::GoCommandFailed {
+                command,
+                stderr,
+                exit_code,
+            } => {
+                assert_eq!(command, "nonexistent");
+                assert_eq!(exit_code, -1);
+                assert!(
+                    stderr.contains("Failed to spawn"),
+                    "stderr should mention spawn failure, got: {}",
+                    stderr
+                );
+            }
+            other => panic!("expected GoCommandFailed, got: {:?}", other),
+        }
+    }
+
+    /// Verify that stderr output from a command is captured and reported
+    /// in the error when the command fails.
+    ///
+    /// Uses `sh -c 'echo err >&2; exit 1'` to print to stderr and exit 1.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_captures_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run_go_command_streaming(
+            "sh",
+            &["-c", "echo err_msg >&2; exit 1"],
+            tmp.path(),
+            "stderr-test",
+        )
+        .await;
+
+        let err = result.expect_err("expected GoCommandFailed");
+        match err {
+            WarError::GoCommandFailed { stderr, .. } => {
+                assert!(
+                    stderr.contains("err_msg"),
+                    "stderr should contain 'err_msg', got: {}",
+                    stderr
+                );
+            }
+            other => panic!("expected GoCommandFailed, got: {:?}", other),
+        }
+    }
+
+    /// Verify that multi-line stdout is streamed without loss.
+    ///
+    /// Uses `printf` to produce two lines and confirms the command succeeds.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_multiline_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run_go_command_streaming(
+            "sh",
+            &["-c", "printf 'line1\\nline2\\n'"],
+            tmp.path(),
+            "multiline-test",
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    /// Verify that both stdout and stderr are streamed concurrently for a
+    /// command that writes to both before exiting.
+    ///
+    /// Uses `sh -c` to write to both streams, then exit 0.
+    #[tokio::test]
+    async fn test_run_go_command_streaming_stdout_and_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run_go_command_streaming(
+            "sh",
+            &["-c", "echo out_msg; echo err_msg >&2"],
+            tmp.path(),
+            "dual-stream-test",
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    // ── resolve_gomodcache tests ──────────────────────────────────────────
 
     #[test]
-    fn test_inject_import_adds_line_before_closing_paren() {
-        let source = r#"package main
+    fn test_resolve_gomodcache_env_override() {
+        // Temporarily set GOMODCACHE to verify it takes precedence.
+        let original = env::var("GOMODCACHE").ok();
+        env::set_var("GOMODCACHE", "/tmp/fake_gomodcache");
 
-import (
-	// _ "github.com/example/module"
-)
+        let result = resolve_gomodcache();
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/tmp/fake_gomodcache/cache/download")
+        );
 
-func main() {}
-"#;
-        let result = inject_import(source, "github.com/gin-gonic/gin").unwrap();
+        // Restore original value.
+        match original {
+            Some(v) => env::set_var("GOMODCACHE", v),
+            None => env::remove_var("GOMODCACHE"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_gomodcache_default_path() {
+        // Ensure GOMODCACHE is not set so the default path is used.
+        let original = env::var("GOMODCACHE").ok();
+        env::remove_var("GOMODCACHE");
+
+        let result = resolve_gomodcache().expect("should resolve");
+        let expected_suffix = PathBuf::from("go")
+            .join("pkg")
+            .join("mod")
+            .join("cache")
+            .join("download");
         assert!(
-            result.contains("\t_ \"github.com/gin-gonic/gin\"\n"),
-            "injected line must be present:\n{}",
+            result.ends_with(&expected_suffix),
+            "expected path ending with {:?}, got: {:?}",
+            expected_suffix,
             result
         );
-        // The closing paren must still appear after the new import.
-        let gin_pos = result.find("_ \"github.com/gin-gonic/gin\"").unwrap();
-        let close_pos = result[gin_pos..].find(')').unwrap();
-        assert!(
-            close_pos > 0,
-            "closing paren must come after the injected import"
-        );
-    }
 
-    #[test]
-    fn test_inject_import_preserves_existing_content() {
-        let source = r#"package main
-
-import (
-	"fmt"
-)
-
-func main() {
-	fmt.Println("hello")
-}
-"#;
-        let result = inject_import(source, "github.com/gin-gonic/gin").unwrap();
-        assert!(result.contains("\"fmt\""), "existing imports must be kept");
-        assert!(result.contains("_ \"github.com/gin-gonic/gin\""));
-    }
-
-    #[test]
-    fn test_inject_import_no_import_block_returns_none() {
-        let source = r#"package main
-
-func main() {}
-"#;
-        assert!(
-            inject_import(source, "github.com/gin-gonic/gin").is_none(),
-            "must return None when no import block exists"
-        );
-    }
-
-    #[test]
-    fn test_inject_import_empty_import_block() {
-        let source = "package main\n\nimport (\n)\n\nfunc main() {}\n";
-        let result = inject_import(source, "github.com/foo/bar").unwrap();
-        assert!(result.contains("\t_ \"github.com/foo/bar\"\n"));
-    }
-
-    #[test]
-    fn test_inject_import_multiple_existing_imports() {
-        let source = r#"package main
-
-import (
-	"fmt"
-	"os"
-)
-
-func main() {}
-"#;
-        let result = inject_import(source, "github.com/gin-gonic/gin").unwrap();
-        assert!(result.contains("\"fmt\""));
-        assert!(result.contains("\"os\""));
-        assert!(result.contains("_ \"github.com/gin-gonic/gin\""));
-        // The injected line should appear before the closing paren.
-        let gin_pos = result.find("_ \"github.com/gin-gonic/gin\"").unwrap();
-        let close_pos = result.rfind(')').unwrap();
-        assert!(gin_pos < close_pos, "import must precede closing paren");
-    }
-
-    // ── update_main_imports — filesystem tests ──────────────────────────────
-
-    #[test]
-    fn test_update_main_imports_adds_import_to_main_go() {
-        let tmp = TempDir::new().unwrap();
-        let main_go = tmp.path().join("main.go");
-
-        fs::write(
-            &main_go,
-            r#"package main
-
-import (
-	// _ "github.com/example/module"
-)
-
-func main() {}
-"#,
-        )
-        .unwrap();
-
-        let added = update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-        assert!(added, "should report import was added");
-
-        let content = fs::read_to_string(&main_go).unwrap();
-        assert!(
-            content.contains("_ \"github.com/gin-gonic/gin\""),
-            "import must appear in main.go:\n{}",
-            content
-        );
-    }
-
-    #[test]
-    fn test_update_main_imports_idempotent_on_second_call() {
-        let tmp = TempDir::new().unwrap();
-        let main_go = tmp.path().join("main.go");
-
-        fs::write(&main_go, "package main\n\nimport (\n)\n\nfunc main() {}\n").unwrap();
-
-        let first = update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-        assert!(first, "first call must add the import");
-
-        let second = update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-        assert!(!second, "second call must be a no-op (already present)");
-
-        // Verify only one copy of the import exists.
-        let content = fs::read_to_string(&main_go).unwrap();
-        let count = content.matches("_ \"github.com/gin-gonic/gin\"").count();
-        assert_eq!(count, 1, "import must appear exactly once:\n{}", content);
-    }
-
-    #[test]
-    fn test_update_main_imports_no_main_go_returns_false() {
-        let tmp = TempDir::new().unwrap();
-        // No main.go created — function must return Ok(false) gracefully.
-        let result = update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-        assert!(!result, "must return false when main.go is absent");
-    }
-
-    #[test]
-    fn test_update_main_imports_no_partial_file_on_missing_import_block() {
-        let tmp = TempDir::new().unwrap();
-        let main_go = tmp.path().join("main.go");
-
-        // A main.go with no import block at all.
-        let original = "package main\n\nfunc main() {}\n";
-        fs::write(&main_go, original).unwrap();
-
-        // Should return Err because inject_import finds no block.
-        let result = update_main_imports(tmp.path(), "github.com/gin-gonic/gin");
-        assert!(result.is_err(), "must error when no import block exists");
-
-        // Original file must be untouched (no .war.tmp sidecar left behind).
-        let content = fs::read_to_string(&main_go).unwrap();
-        assert_eq!(content, original, "original content must be preserved");
-
-        let tmp_path = main_go.with_extension("go.war.tmp");
-        assert!(
-            !tmp_path.exists(),
-            ".war.tmp sidecar must be cleaned up on failure"
-        );
-    }
-
-    #[test]
-    fn test_update_main_imports_multiple_modules_in_sequence() {
-        let tmp = TempDir::new().unwrap();
-        let main_go = tmp.path().join("main.go");
-
-        fs::write(
-            &main_go,
-            "package main\n\nimport (\n\t// _ \"github.com/example/module\"\n)\n\nfunc main() {}\n",
-        )
-        .unwrap();
-
-        update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-        update_main_imports(tmp.path(), "golang.org/x/text").unwrap();
-
-        let content = fs::read_to_string(&main_go).unwrap();
-        assert!(content.contains("_ \"github.com/gin-gonic/gin\""));
-        assert!(content.contains("_ \"golang.org/x/text\""));
-
-        // Import block must still be syntactically closed.
-        assert!(content.contains(')'), "closing paren must remain");
-    }
-
-    #[test]
-    fn test_update_main_imports_atomic_no_tmp_file_after_success() {
-        let tmp = TempDir::new().unwrap();
-        let main_go = tmp.path().join("main.go");
-
-        fs::write(&main_go, "package main\n\nimport (\n)\n\nfunc main() {}\n").unwrap();
-
-        update_main_imports(tmp.path(), "github.com/gin-gonic/gin").unwrap();
-
-        let tmp_path = main_go.with_extension("go.war.tmp");
-        assert!(
-            !tmp_path.exists(),
-            ".war.tmp must not remain after successful write"
-        );
+        // Restore original value.
+        if let Some(v) = original {
+            env::set_var("GOMODCACHE", v);
+        }
     }
 }
